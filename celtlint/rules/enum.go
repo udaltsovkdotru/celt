@@ -19,22 +19,15 @@ import (
 type enumWarning func(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index, refMap map[int64]*celast.ReferenceInfo) *celtlint.Finding
 
 func checkEnum(src common.Source, ast *cel.Ast, idx *celtindex.Index, warn enumWarning) []celtlint.Finding {
-	checked, err := cel.AstToCheckedExpr(ast)
-	if err != nil {
-		return nil
-	}
-	native, err := celast.ToAST(checked)
-	if err != nil {
-		return nil
-	}
+	// Walk the checked native AST (which carries type info) while reading source
+	// positions from the same native AST's source info. Re-parsing or
+	// round-tripping through a proto CheckedExpr would either renumber node ids
+	// (macro expansion) or collapse offset ranges to start-only, breaking spans.
+	native := ast.NativeRep()
 	refMap := native.ReferenceMap()
 
-	parsed := celtlint.ParseUnexpanded(src)
-	var sp ExprSpans
-	if parsed != nil {
-		content := src.Content()
-		sp = ExprSpans{info: parsed.SourceInfo(), ro: celtsource.RuneOffsets(content), content: content}
-	}
+	content := src.Content()
+	sp := ExprSpans{info: native.SourceInfo(), ro: celtsource.RuneOffsets(content), content: content}
 
 	var out []celtlint.Finding
 	WalkNavigable(celast.NavigateAST(native), func(nav celast.NavigableExpr) bool {
@@ -186,9 +179,16 @@ func compareErrorMessage(a, b enumOperand) string {
 }
 
 func rawEnumWarning(sp ExprSpans, nav celast.NavigableExpr, a, b enumOperand, args []celast.Expr, idx *celtindex.Index) *celtlint.Finding {
-	enumFull, val, enumSide := b.enum, a.val, args[1]
-	if b.kind == kindInt {
-		enumFull, val, enumSide = a.enum, b.val, args[0]
+	// One operand is a raw integer literal and the other is enum-typed. The fix
+	// must replace the integer literal itself (not the enum operand) with the
+	// named enum value it corresponds to, so enumSide is the literal's operand.
+	enumFull, val := b.enum, a.val
+	enumSide := args[0]
+	switch {
+	case a.kind == kindInt:
+		enumFull, val, enumSide = b.enum, a.val, args[0]
+	case b.kind == kindInt:
+		enumFull, val, enumSide = a.enum, b.val, args[1]
 	}
 
 	ns, ne := celtlint.ExprByteSpan(sp.info, sp.ro, nav)

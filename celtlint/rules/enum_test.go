@@ -355,6 +355,11 @@ func TestRawEnumValueFlagsNumericLiteral(t *testing.T) {
 	if f.Fix != "Status.ACTIVE" {
 		t.Errorf("Fix = %q, want %q", f.Fix, "Status.ACTIVE")
 	}
+	// The fix must target the integer literal (char 12-13), not the enum
+	// operand `p.status` (char 0-7).
+	if f.FixStart.Line != 0 || f.FixStart.Char != 12 || f.FixEnd.Line != 0 || f.FixEnd.Char != 13 {
+		t.Errorf("fix range = %v-%v, want char 12-13 (the literal 1)", f.FixStart, f.FixEnd)
+	}
 	if f.Level != celtlint.LevelWarn {
 		t.Errorf("Level = %v, want warn", f.Level)
 	}
@@ -372,6 +377,41 @@ func TestRawEnumValueRightSideNumericLiteral(t *testing.T) {
 	}
 	if f.Fix != "Status.INACTIVE" {
 		t.Errorf("Fix = %q, want %q (value 2 of Status)", f.Fix, "Status.INACTIVE")
+	}
+	// The fix must target the integer literal (char 0-1), not the enum operand.
+	if f.FixStart.Line != 0 || f.FixStart.Char != 0 || f.FixEnd.Line != 0 || f.FixEnd.Char != 1 {
+		t.Errorf("fix range = %v-%v, want char 0-1 (the literal 2)", f.FixStart, f.FixEnd)
+	}
+}
+
+func TestRawEnumValueSpanInMacroExpandedExpr(t *testing.T) {
+	// The raw enum comparison sits inside a multi-line expression that also
+	// contains a macro (`has`). Macro expansion renumbers AST node ids, so the
+	// finding's spans must be read from the checked AST's own source info
+	// rather than a fresh unexpanded re-parse (which would map ids to wrong
+	// positions and corrupt the fix).
+	content := "has(p.role)\n  && p.status == 1\n  && p.role == test.Role.ADMIN"
+	fs := enAnalyze(t, enRawEnumRule{RuleMeta: celtlint.RuleMeta{
+		Name:     enRawEnumName,
+		Defaults: celtlint.RuleParams{Level: celtlint.LevelWarn},
+	}}, content)
+
+	f, ok := enFindByCode(fs, celtlint.CodeRawEnumValue)
+	if !ok {
+		t.Fatalf("no raw-enum-value finding in %+v", fs)
+	}
+	if f.Fix != "Status.ACTIVE" {
+		t.Errorf("Fix = %q, want %q (value 1 of Status)", f.Fix, "Status.ACTIVE")
+	}
+	// The literal `1` is on line 1 (0-indexed), chars 17-18 of
+	// "  && p.status == 1". The fix must target it, not a node on another line.
+	if f.FixStart.Line != 1 || f.FixStart.Char != 17 || f.FixEnd.Line != 1 || f.FixEnd.Char != 18 {
+		t.Errorf("fix range = %v-%v, want line 1 chars 17-18 (the literal 1)", f.FixStart, f.FixEnd)
+	}
+	// The primary span must be the single-line comparison `p.status == 1`
+	// (line 1, chars 5-18), not spanning across lines.
+	if f.Start.Line != 1 || f.Start.Char != 5 || f.End.Line != 1 || f.End.Char != 18 {
+		t.Errorf("finding span = %v-%v, want line 1 chars 5-18", f.Start, f.End)
 	}
 }
 
