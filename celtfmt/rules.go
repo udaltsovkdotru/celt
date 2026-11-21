@@ -11,8 +11,10 @@ type FormatParams struct {
 	// Enabled reports whether the rule is active when not explicitly
 	// configured. Some rules (e.g. break operators) are off by default.
 	Enabled bool
-	// Config is the rule's default configuration as raw bytes, applied before
-	// any user-supplied config. May be nil when the rule has no config.
+	// Config is the rule's default configuration as raw bytes, used when no
+	// consumer-supplied config is present. When a consumer supplies raw config
+	// (under fmt[<name>]) it replaces this default rather than being layered on
+	// top of it. May be nil when the rule has no config.
 	Config []byte
 }
 
@@ -30,9 +32,10 @@ type FormatRule interface {
 }
 
 // Configurable is implemented by a FormatRule that accepts per-rule
-// configuration. The framework passes the rule's default config (from
-// Defaults), then its raw config bytes (from under fmt[<name>]), to ApplyConfig
-// before the rule runs.
+// configuration. The framework passes ApplyConfig either the rule's default
+// config (from Defaults) or, when the consumer supplies raw config bytes
+// (under fmt[<name>]), those bytes instead — the user-supplied config replaces
+// the default rather than being layered on top of it.
 type Configurable interface {
 	FormatRule
 	celtplugin.Configurable

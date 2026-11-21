@@ -1,7 +1,7 @@
-//nolint:goconst // test tables intentionally repeat strings
 package celtlint
 
 import (
+	"strings"
 	"testing"
 
 	"cel.dev/cel-go/cel"
@@ -12,6 +12,9 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
+
+	"github.com/udaltsovkdotru/celt/celtfmt"
+	"github.com/udaltsovkdotru/celt/celtfmt/rules"
 )
 
 // Test string constants reused across table rows so golangci goconst stays
@@ -22,6 +25,7 @@ const (
 	hvAlphaBeta  = "alpha\nbeta"
 	hvFoo        = "foo"
 	hvBar        = "bar"
+	hvInt        = "int"
 	hvMemberFn   = "hvMember"
 	hvMacroFn    = "hv_macro"
 	hvMacroName  = "hv_m"
@@ -111,6 +115,100 @@ func hvFileDescriptorSet(t *testing.T) *descriptorpb.FileDescriptorSet {
 			},
 		},
 	}
+}
+
+func TestFieldDocumentationUsesReceiverType(t *testing.T) {
+	fdset := hvFileDescriptorSet(t)
+	person := fdset.File[0]
+	for _, loc := range person.GetSourceCodeInfo().GetLocation() {
+		loc.Span = []int32{0, 0, 1}
+	}
+	company := proto.CloneOf(person)
+	company.Name = proto.String("company.proto")
+	company.EnumType = nil
+	company.MessageType[0].Name = proto.String("Company")
+	company.MessageType[0].Field[0].Type = descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum()
+	company.SourceCodeInfo.Location = []*descriptorpb.SourceCodeInfo_Location{{
+		Path: []int32{4, 0, 2, 0}, Span: []int32{0, 0, 1}, LeadingComments: proto.String("company name field"),
+	}}
+	fdset.File = append(fdset.File, company)
+	a := hvProtoAnalyzer(t, fdset)
+
+	for _, tc := range []struct{ expr, signature, doc string }{
+		{expr: "person.name", signature: "name string", doc: "person name field"},
+		{expr: "company.name", signature: "name int", doc: "company name field"},
+		{expr: "[person][0].name", signature: "name string", doc: "person name field"},
+	} {
+		t.Run(tc.expr, func(t *testing.T) {
+			got := a.Hover(tc.expr, 0, len(tc.expr)-1)
+			if !strings.Contains(got, tc.signature) || !strings.Contains(got, tc.doc) {
+				t.Errorf("hover = %q, want signature %q and documentation %q", got, tc.signature, tc.doc)
+			}
+			items := a.Completion(tc.expr, 0, len(tc.expr)-len("me"))
+			for _, item := range items {
+				if item.Label != "name" {
+					continue
+				}
+				if !strings.Contains(item.Documentation, tc.signature) || !strings.Contains(item.Documentation, tc.doc) {
+					t.Errorf("completion documentation = %q, want signature %q and documentation %q", item.Documentation, tc.signature, tc.doc)
+				}
+				return
+			}
+			t.Errorf("completion = %+v, want a name field", items)
+		})
+	}
+}
+
+func TestHoverDocsRespectTokenKindAndLexicalBinding(t *testing.T) {
+	const docs = "global message text"
+	env, err := cel.NewEnv(cel.VariableWithDoc("item", cel.StringType, docs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		src    string
+		global bool
+	}{
+		{src: `item`, global: true},
+		{src: `[1].exists(item, item > 0)`},
+		{src: `"item"`},
+	} {
+		got := a.Hover(tc.src, 0, strings.LastIndex(tc.src, "item"))
+		if strings.Contains(got, docs) != tc.global {
+			t.Errorf("hover for %q = %q, want global documentation=%v", tc.src, got, tc.global)
+		}
+	}
+}
+
+func TestHoverShowsProtoFieldTypeWithoutSourceInfo(t *testing.T) {
+	fdset := hvFileDescriptorSet(t)
+	fdset.File[0].SourceCodeInfo = nil
+	a := hvProtoAnalyzer(t, fdset)
+	const expr = "person.name"
+	if got := a.Hover(expr, 0, len(expr)-1); !strings.Contains(got, "name string") {
+		t.Errorf("hover = %q, want field signature even without source comments", got)
+	}
+}
+
+func hvProtoAnalyzer(t *testing.T, fdset *descriptorpb.FileDescriptorSet) *Analyzer {
+	t.Helper()
+	opts := []cel.EnvOption{cel.TypeDescs(fdset), cel.Variable("person", cel.ObjectType("Person"))}
+	if len(fdset.File) > 1 {
+		opts = append(opts, cel.Variable("company", cel.ObjectType("Company")))
+	}
+	env, err := cel.NewEnv(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(env, WithDescriptor(fdset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
 }
 
 // TestLoadHoverDocs verifies that loading docs from a real env and fdset
@@ -235,7 +333,7 @@ func TestHoverDocsLookup(t *testing.T) {
 		{
 			name:         "member filtered int",
 			key:          hvMemberFn,
-			receiverElem: "int",
+			receiverElem: hvInt,
 			want:         "```go\nfunc ([]int) hvMember(int) int\n```",
 		},
 		{
@@ -330,7 +428,7 @@ func TestRenderMacroCallHover(t *testing.T) {
 	}{
 		{
 			name: "full",
-			mc:   &MacroCall{Name: hvMacroName, ResultType: "int", Expansion: "a ? b : c"},
+			mc:   &MacroCall{Name: hvMacroName, ResultType: hvInt, Expansion: "a ? b : c"},
 			desc: "doc",
 			want: "macro `hv_m` → int\n\ndoc\n\nexpands to:\n```cel\na ? b : c\n```",
 		},
@@ -353,10 +451,38 @@ func TestRenderMacroCallHover(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := renderMacroCallHover(tt.mc, tt.desc); got != tt.want {
+			if got := renderMacroCallHover(tt.mc, tt.desc, nil); got != tt.want {
 				t.Errorf("renderMacroCallHover() =\n%q\nwant\n%q", got, tt.want)
 			}
 		})
+	}
+}
+
+// fmHoverCfg is a minimal celtfmt.Config carrying an explicit rule list, used
+// to verify the macro expansion follows the configured layout.
+type fmHoverCfg struct{ r []celtfmt.FormatRule }
+
+func (c fmHoverCfg) Rules() []celtfmt.FormatRule { return c.r }
+
+// TestRenderMacroCallHoverFormatsExpansion verifies the desugared macro
+// expansion in the hover is formatted according to the supplied celtfmt config
+// (here a break-operators rule), and falls back to the default inline layout
+// without a config.
+func TestRenderMacroCallHoverFormatsExpansion(t *testing.T) {
+	mc := &MacroCall{Name: hvMacroName, Expansion: "cond ? yes : no"}
+	breakOps := fmHoverCfg{r: []celtfmt.FormatRule{rules.NewBreakOperatorsRule()}}
+	formatted := renderMacroCallHover(mc, "", breakOps)
+	for _, want := range []string{"cond\n? yes\n: no"} {
+		if !strings.Contains(formatted, want) {
+			t.Errorf("break-operators hover missing formatted expansion %q:\n%s", want, formatted)
+		}
+	}
+	if strings.Contains(formatted, "cond ? yes : no") {
+		t.Errorf("break-operators hover kept the inline expansion:\n%s", formatted)
+	}
+	inline := renderMacroCallHover(mc, "", nil)
+	if !strings.Contains(inline, "cond ? yes : no") {
+		t.Errorf("default hover = %q, want the inline expansion", inline)
 	}
 }
 
@@ -368,7 +494,7 @@ func TestCelTypeName(t *testing.T) {
 		want string
 	}{
 		{name: "nil", t: nil, want: dynTypeName},
-		{name: "int primitive", t: celtypes.IntType, want: "int"},
+		{name: "int primitive", t: celtypes.IntType, want: hvInt},
 		{name: "bool primitive", t: celtypes.BoolType, want: "bool"},
 		{name: "string primitive", t: celtypes.StringType, want: "string"},
 		{name: "list of int", t: celtypes.NewListType(celtypes.IntType), want: "[]int"},

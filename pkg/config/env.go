@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -101,16 +102,48 @@ type Enum struct {
 // expected to be a mapping whose "env" key holds the environment; an empty
 // document yields an empty Env.
 func ParseEnv(data []byte) (*Env, error) {
-	var root struct {
-		Env Env `yaml:"env"`
-	}
+	var root map[string]yaml.Node
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("parse env: %w", err)
 	}
-	if err := root.Env.validate(); err != nil {
+	env := &Env{}
+	node, ok := root["env"]
+	if !ok {
+		return env, nil
+	}
+	// Reject unknown env keys (e.g. "variablez") so a mistyped key is not
+	// silently left unapplied. The node is decoded directly (not re-encoded and
+	// reparsed) so a YAML alias defined elsewhere in the document resolves;
+	// re-encoding the node would drop the anchor definitions and fail on the
+	// alias.
+	if err := checkEnvKeys(&node); err != nil {
 		return nil, err
 	}
-	return &root.Env, nil
+	if err := node.Decode(env); err != nil {
+		return nil, fmt.Errorf("parse env: %w", err)
+	}
+	if err := env.validate(); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+// checkEnvKeys rejects a top-level env key that is not a recognized section, so
+// a mistyped section name (e.g. "variablez") is reported instead of silently
+// leaving the intended settings unapplied.
+func checkEnvKeys(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		switch key {
+		case "container", "abbreviations", "extensions", "variables", "functions", "types", "macros":
+		default:
+			return fmt.Errorf("parse env: unknown key %q", key)
+		}
+	}
+	return nil
 }
 
 func (e *Env) validate() error {
@@ -118,6 +151,9 @@ func (e *Env) validate() error {
 		return err
 	}
 	if err := e.validateFunctions(); err != nil {
+		return err
+	}
+	if err := e.validateTypes(); err != nil {
 		return err
 	}
 	return e.validateMacros()
@@ -173,6 +209,24 @@ func (e *Env) validateFunctions() error {
 	return nil
 }
 
+func (e *Env) validateTypes() error {
+	if e.Types == nil {
+		return nil
+	}
+	seenMsg := map[string]bool{}
+	for _, m := range e.Types.Messages {
+		// Registration strips a leading dot from the name alias; validate
+		// against the same normalized name so aliases like "native.Account"
+		// and ".native.Account" are detected as duplicates.
+		name := strings.TrimPrefix(m.Name, ".")
+		if seenMsg[name] {
+			return fmt.Errorf("env.types.messages[%q]: duplicate message name", m.Name)
+		}
+		seenMsg[name] = true
+	}
+	return nil
+}
+
 func (e *Env) validateMacros() error {
 	seenMacro := map[string]bool{}
 	for _, m := range e.Macros {
@@ -183,28 +237,107 @@ func (e *Env) validateMacros() error {
 			return fmt.Errorf("env.macros[%q]: duplicate", m.Name)
 		}
 		seenMacro[m.Name] = true
-		if len(m.Overloads) == 0 && len(m.Results) == 0 {
-			return fmt.Errorf("env.macros[%q]: at least one of overloads or results is required", m.Name)
+		if err := validateMacro(&m); err != nil {
+			return err
 		}
-		seenOv := map[string]bool{}
-		for _, ov := range m.Overloads {
-			if ov.ID != "" && seenOv[ov.ID] {
-				return fmt.Errorf("env.macros[%q]: duplicate overload id %q", m.Name, ov.ID)
-			}
-			if ov.ID != "" {
-				seenOv[ov.ID] = true
-			}
-			if ov.Result == "" {
-				return fmt.Errorf("env.macros[%q] overload %q: missing result type", m.Name, ov.ID)
-			}
+	}
+	return nil
+}
+
+// validateMacro checks the non-duplicate constraints of a single macro.
+func validateMacro(m *Macro) error {
+	if len(m.Overloads) == 0 && len(m.Results) == 0 {
+		return fmt.Errorf("env.macros[%q]: at least one of overloads or results is required", m.Name)
+	}
+	if err := validateMacroOverloads(m); err != nil {
+		return err
+	}
+	for _, r := range m.Results {
+		if r == "" {
+			return fmt.Errorf("env.macros[%q]: empty result type", m.Name)
 		}
-		for _, r := range m.Results {
-			if r == "" {
-				return fmt.Errorf("env.macros[%q]: empty result type", m.Name)
-			}
+	}
+	if len(m.Results) > 1 {
+		// CEL overloads are keyed by argument signature, so a macro with
+		// unconstrained (dyn) arguments can expose only one output type;
+		// several would collide. Distinct signatures require explicit
+		// overloads instead.
+		return fmt.Errorf("env.macros[%q]: multiple results with unconstrained arguments are "+
+			"unsupported; use explicit overloads for distinct signatures", m.Name)
+	}
+	if !m.VarArg && m.FixedArity < 0 {
+		return fmt.Errorf("env.macros[%q]: fixed_arity must be >= 0", m.Name)
+	}
+	if len(m.Overloads) > 0 && !m.VarArg {
+		if err := validateOverloadArities(m); err != nil {
+			return err
 		}
-		if !m.VarArg && m.FixedArity < 0 {
-			return fmt.Errorf("env.macros[%q]: fixed_arity must be >= 0", m.Name)
+	}
+	return validateMacroResultCollisions(m)
+}
+
+// validateMacroOverloads checks the per-overload constraints of a macro.
+func validateMacroOverloads(m *Macro) error {
+	seenOv := map[string]bool{}
+	for _, ov := range m.Overloads {
+		if ov.ID != "" && seenOv[ov.ID] {
+			return fmt.Errorf("env.macros[%q]: duplicate overload id %q", m.Name, ov.ID)
+		}
+		if ov.ID != "" {
+			seenOv[ov.ID] = true
+		}
+		if ov.Result == "" {
+			return fmt.Errorf("env.macros[%q] overload %q: missing result type", m.Name, ov.ID)
+		}
+		// A receiver macro's overloads are member overloads, so the
+		// receiver is always Args[0]; an overload with no arguments can
+		// never match a receiver call, even when vararg.
+		if m.Receiver && len(ov.Args) == 0 {
+			return fmt.Errorf("env.macros[%q] overload %q: receiver macro overload must declare a receiver argument", m.Name, ov.ID)
+		}
+	}
+	return nil
+}
+
+// validateOverloadArities checks that each overload's argument count agrees
+// with a fixed_arity macro. A fixed-arity macro's overloads must agree with
+// fixed_arity: the passthrough macro accepts exactly fixed_arity arguments, so
+// an overload of a different arity could never match a parsed call.
+func validateOverloadArities(m *Macro) error {
+	for _, ov := range m.Overloads {
+		n := len(ov.Args)
+		if m.Receiver {
+			n--
+		}
+		if n != m.FixedArity {
+			return fmt.Errorf("env.macros[%q] overload %q: argument count (%d) disagrees with fixed_arity (%d)", m.Name, ov.ID, n, m.FixedArity)
+		}
+	}
+	return nil
+}
+
+// validateMacroResultCollisions checks that unconstrained results do not
+// collide with explicit overloads at the same arity.
+func validateMacroResultCollisions(m *Macro) error {
+	if len(m.Overloads) == 0 || len(m.Results) == 0 {
+		return nil
+	}
+	// A macro combining exact overloads with unconstrained results builds
+	// a result overload at each accepted arity; when one collides with an
+	// explicit overload (same arity, dyn args overlap any type), cel-go
+	// rejects the environment. Catch it here with a clear message.
+	resArities := map[int]bool{}
+	for _, n := range macroArities(m) {
+		resArities[n] = true
+	}
+	for _, ov := range m.Overloads {
+		n := len(ov.Args)
+		if m.Receiver {
+			n--
+		}
+		if resArities[n] {
+			return fmt.Errorf("env.macros[%q] overload %q: result signature collides with an "+
+				"unconstrained result at arity %d; use only overloads or only results", m.Name, ov.ID, n)
 		}
 	}
 	return nil

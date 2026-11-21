@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,27 @@ func e2eRun(t *testing.T, bin, dir string, args ...string) (stdout, stderr strin
 		code = ee.ExitCode()
 	}
 	return outBuf.String(), errBuf.String(), code
+}
+
+// e2eRunStdin runs the binary with the given stdin and returns stderr and the
+// exit code.
+func e2eRunStdin(t *testing.T, bin, dir, stdin string, args ...string) (stderr string, code int) {
+	t.Helper()
+	cmd := exec.CommandContext(context.Background(), bin, args...)
+	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader(stdin)
+	var errBuf strings.Builder
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err != nil {
+		ee, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("e2e: run %v: %v", args, err)
+		}
+		code = ee.ExitCode()
+	}
+	return errBuf.String(), code
 }
 
 // e2eWriteFile creates parent dirs and writes content to path.
@@ -211,9 +233,9 @@ func TestE2ELintFixPartial(t *testing.T) {
 	}
 }
 
-// e2eTestFormatWrite verifies that `format --write` rewrites the file on disk
-// to the formatted content, reports the rewritten file, and exits non-zero
-// when it changed (like --check), then exits 0 once the file is formatted.
+// TestE2EFormatWrite verifies `format --write` rewrites the file on disk to the
+// formatted content, reports the rewritten file, and exits 0 on a successful
+// rewrite (only `--check` exits 1 when a file is not formatted).
 func TestE2EFormatWrite(t *testing.T) {
 	bin := e2eBinary(t)
 	proj := t.TempDir()
@@ -221,10 +243,10 @@ func TestE2EFormatWrite(t *testing.T) {
 	file := filepath.Join(proj, "fmt_me.cel")
 	e2eWriteFile(t, file, "foo(bar,baz)\n")
 
-	// First pass rewrites the file: non-zero exit and the file is reported.
+	// First pass rewrites the file: successful exit 0 and the file is reported.
 	_, stderr, code := e2eRun(t, bin, proj, "format", "--write", file)
-	if code != 1 {
-		t.Fatalf("format --write (dirty): exit=%d, want 1; stderr=%s", code, stderr)
+	if code != 0 {
+		t.Fatalf("format --write (dirty): exit=%d, want 0; stderr=%s", code, stderr)
 	}
 	if !strings.Contains(stderr, "fmt_me.cel") {
 		t.Errorf("format --write (dirty): expected the file to be reported, got %q", stderr)
@@ -241,6 +263,27 @@ func TestE2EFormatWrite(t *testing.T) {
 	_, stderr, code = e2eRun(t, bin, proj, "format", "--write", file)
 	if code != 0 {
 		t.Errorf("format --write (clean): exit=%d, want 0; stderr=%s", code, stderr)
+	}
+}
+
+// TestE2EFormatCheckStdin verifies --check is honored on stdin (exit 1 when the
+// piped content is unformatted) and --write is rejected on stdin.
+func TestE2EFormatCheckStdin(t *testing.T) {
+	bin := e2eBinary(t)
+	proj := t.TempDir()
+	e2eWriteFile(t, filepath.Join(proj, ".celt.yml"), e2eConfig)
+
+	_, code := e2eRunStdin(t, bin, proj, "a+b", "format", "--check", "-")
+	if code != 1 {
+		t.Errorf("format --check - (unformatted): exit=%d, want 1", code)
+	}
+	_, code = e2eRunStdin(t, bin, proj, "a + b\n", "format", "--check", "-")
+	if code != 0 {
+		t.Errorf("format --check - (formatted): exit=%d, want 0", code)
+	}
+	stderr, code := e2eRunStdin(t, bin, proj, "a+b", "format", "--write", "-")
+	if code != 1 || !strings.Contains(stderr, "--write") {
+		t.Errorf("format --write -: exit=%d, stderr=%q; want 1 with a --write error", code, stderr)
 	}
 }
 

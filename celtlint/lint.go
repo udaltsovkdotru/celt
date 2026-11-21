@@ -1,10 +1,14 @@
 package celtlint
 
 import (
+	"sync"
+
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common"
+	celast "cel.dev/cel-go/common/ast"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 
+	"github.com/udaltsovkdotru/celt/celtfmt"
 	"github.com/udaltsovkdotru/celt/celtindex"
 	"github.com/udaltsovkdotru/celt/celtplugin"
 	"github.com/udaltsovkdotru/celt/celtsource"
@@ -74,6 +78,7 @@ type Config struct {
 	fdset    *descriptorpb.FileDescriptorSet
 	provider ConfigProvider
 	rules    []Rule
+	fmtCfg   celtfmt.Config
 }
 
 func WithDescriptor(fdset *descriptorpb.FileDescriptorSet) Option {
@@ -89,14 +94,23 @@ func WithConfigProvider(p ConfigProvider) Option {
 	return func(c *Config) { c.provider = p }
 }
 
+// WithFormatConfig supplies the celtfmt configuration used to render the
+// desugared expansion of a macro invocation in hover. When nil, the default
+// celtfmt layout applies.
+func WithFormatConfig(cfg celtfmt.Config) Option {
+	return func(c *Config) { c.fmtCfg = cfg }
+}
+
 type Analyzer struct {
-	env      *cel.Env
-	fdset    *descriptorpb.FileDescriptorSet
-	index    *celtindex.Index
-	docs     *HoverDocs
-	provider ConfigProvider
-	rules    []Rule
-	built    bool
+	env       *cel.Env
+	trackEnv  *cel.Env
+	fdset     *descriptorpb.FileDescriptorSet
+	index     *celtindex.Index
+	docs      *HoverDocs
+	provider  ConfigProvider
+	rules     []Rule
+	fmtCfg    celtfmt.Config
+	buildOnce sync.Once
 }
 
 func New(env *cel.Env, opts ...Option) (*Analyzer, error) {
@@ -104,7 +118,14 @@ func New(env *cel.Env, opts ...Option) (*Analyzer, error) {
 	for _, o := range opts {
 		o(c)
 	}
-	a := &Analyzer{env: env, provider: c.provider, fdset: c.fdset}
+	a := &Analyzer{env: env, provider: c.provider, fdset: c.fdset, fmtCfg: c.fmtCfg}
+	// Macro expansion hover relies on the checked AST recording macro calls,
+	// which only happens when the env was built with macro call tracking. Derive
+	// a tracking env for the hover compile (preserving the caller's env for all
+	// other analysis); if the extension fails, hover simply omits expansions.
+	if te, err := env.Extend(cel.EnableMacroCallTracking()); err == nil {
+		a.trackEnv = te
+	}
 	a.rules = append(a.rules, c.rules...)
 	for _, r := range a.rules {
 		cfg := a.effectiveConfig(r)
@@ -120,14 +141,14 @@ func New(env *cel.Env, opts ...Option) (*Analyzer, error) {
 // ensureBuilt builds the environment index and hover docs on first use,
 // memoized. The CLI linter analyzes once per process, so a lazy build avoids
 // the cost when no analysis happens; the long-lived LSP server triggers it on
-// its first document, i.e. near startup.
+// its first document, i.e. near startup. The build is synchronized so that
+// concurrent first use (e.g. parallel LSP requests) builds the index/docs
+// exactly once and no caller observes a partially-initialized analyzer.
 func (a *Analyzer) ensureBuilt() {
-	if a.built {
-		return
-	}
-	a.built = true
-	a.index = celtindex.Build(a.env, a.fdset)
-	a.docs = LoadHoverDocs(a.fdset, a.env)
+	a.buildOnce.Do(func() {
+		a.index = celtindex.Build(a.env, a.fdset)
+		a.docs = LoadHoverDocs(a.fdset, a.env)
+	})
 }
 
 // effectiveConfig merges a rule's declared defaults with the provider
@@ -166,22 +187,53 @@ func (a *Analyzer) AnalyzeSource(src common.Source) []Finding {
 		}
 		before := len(ctx.Findings)
 		r.Check(ctx)
-		// Apply the rule's effective level to findings it did not explicitly
-		// differentiate (i.e. findings the rule reported without a level).
-		if a.provider != nil {
-			if lvl, ok := a.provider.Level(r.Meta().Name); ok {
-				for i := before; i < len(ctx.Findings); i++ {
-					ctx.Findings[i].Level = lvl
-				}
+		// Fill in the rule's effective level (its default, or a config-provider
+		// override) for findings the rule reported without an explicit severity.
+		// A rule that declares Defaults.Level therefore yields findings at that
+		// level even when no provider overrides it; an explicitly-set finding
+		// level is left as the rule chose.
+		for i := before; i < len(ctx.Findings); i++ {
+			if ctx.Findings[i].Level == 0 {
+				ctx.Findings[i].Level = cfg.Level
 			}
 		}
 	}
 	return ctx.Findings
 }
 
+// CompileErrors compiles content with the environment's compiler, independent
+// of whether the compile rule is enabled, and returns the unique compiler error
+// messages. It is used to verify that a candidate fix does not introduce a new
+// compile error: because the check bypasses the configurable compile rule, it
+// still catches an invalid edit even when compile findings are disabled.
+func (a *Analyzer) CompileErrors(content string) []string {
+	if a.env == nil {
+		return nil
+	}
+	_, iss := a.env.Compile(content)
+	if iss == nil || len(iss.Errors()) == 0 {
+		return nil
+	}
+	// One entry per error occurrence (not deduplicated by message): the fix
+	// guard needs to tell a newly-added occurrence of an already-present error
+	// (e.g. a second incompatible ternary) apart from the pre-existing ones.
+	out := make([]string, 0, len(iss.Errors()))
+	for _, e := range iss.Errors() {
+		if e == nil || e.Message == "" {
+			continue
+		}
+		out = append(out, e.Message)
+	}
+	return out
+}
+
 func (a *Analyzer) Hover(content string, line, char int) string {
 	a.ensureBuilt()
 	if a.docs == nil || a.index == nil {
+		return ""
+	}
+	off, lineStart, _, ok := celtsource.LineByteColOffset(content, line, char)
+	if !ok {
 		return ""
 	}
 	name, ok := IdentifierAt(content, line, char)
@@ -190,10 +242,169 @@ func (a *Analyzer) Hover(content string, line, char int) string {
 	}
 	if a.isMacro(name) {
 		if mc, ok := a.macroCallAtCursor(content, line, char); ok {
-			return renderMacroCallHover(mc, a.docs.macros[name])
+			return renderMacroCallHover(mc, a.docs.macros[name], a.fmtCfg)
+		}
+	}
+	// The token must be a genuine identifier reference: text inside a string
+	// literal and a comprehension-local binding (which shadows any same-named
+	// global) must not surface the global's documentation.
+	if insideString(content, off) || a.isComprehensionLocal(content, off, name) {
+		return ""
+	}
+	// Field hover is resolved by the receiver's type so fields sharing a bare
+	// name across messages (Person.name vs Company.name) don't collide, and
+	// indexed/complex receivers (`[person][0]`) resolve to the element type.
+	if dot := receiverDotAt(content, lineStart, off); dot >= 0 {
+		if recv, ok := receiverTextBefore(content, lineStart, dot); ok {
+			if t := a.resolveReceiverType(recv); t != "" {
+				if d, ok := a.docs.fieldFor(t, name); ok {
+					return renderHover(d)
+				}
+			}
 		}
 	}
 	return a.docs.Lookup(name, a.receiverElemAt(content, line, char))
+}
+
+// insideString reports whether byte offset off lies inside a string literal.
+func insideString(content string, off int) bool {
+	i := 0
+	for i < off && i < len(content) {
+		c := content[i]
+		if c == '"' || c == '\'' {
+			next := celtsource.SkipString(content, i)
+			if off < next {
+				return true
+			}
+			i = next
+			continue
+		}
+		i++
+	}
+	return false
+}
+
+// isComprehensionLocal reports whether the identifier named name at byte offset
+// off is bound as a comprehension local (iter/accu/second-iter variable), in
+// which case it shadows any same-named global and must not surface that
+// global's documentation.
+func (a *Analyzer) isComprehensionLocal(content string, off int, name string) bool {
+	if name == "" || a.env == nil {
+		return false
+	}
+	ast := a.compileContent(content)
+	if ast == nil {
+		return false
+	}
+	native := ast.NativeRep()
+	info := native.SourceInfo()
+	ro := celtsource.RuneOffsets(content)
+	found := false
+	celtsource.Walk(native.Expr(), func(e celast.Expr) {
+		if found {
+			return
+		}
+		names, start, end := comprehensionBindScope(info, content, ro, e)
+		if start < 0 || end <= start {
+			return
+		}
+		for _, n := range names {
+			if n == name && start <= off && off < end {
+				found = true
+				return
+			}
+		}
+	})
+	return found
+}
+
+// compileContent compiles content, falling back to a parsed (unchecked) AST when
+// compilation fails but parsing succeeds, so comprehension-scope tracking still
+// works for syntactically-valid-but-untyped expressions.
+func (a *Analyzer) compileContent(content string) *cel.Ast {
+	if checked, iss := a.env.Compile(content); iss == nil || iss.Err() == nil {
+		return checked
+	}
+	if parsed, perr := a.env.Parse(content); parsed != nil && (perr == nil || perr.Err() == nil) {
+		return parsed
+	}
+	return nil
+}
+
+// comprehensionBindScope returns the variable names a comprehension binds and
+// the byte span [start, end) in which they are visible. A comprehension's own
+// offset range is degenerate: its start is the argument-list `(` and there is
+// no stop, so the scope runs from that opening paren to the matching close.
+func comprehensionBindScope(info *celast.SourceInfo, content string, ro []int, e celast.Expr) (names []string, start, end int) {
+	switch e.Kind() {
+	case celast.ComprehensionKind:
+		c := e.AsComprehension()
+		if n := c.IterVar(); n != "" {
+			names = append(names, n)
+		}
+		if c.HasIterVar2() {
+			if n := c.IterVar2(); n != "" {
+				names = append(names, n)
+			}
+		}
+		if n := c.AccuVar(); n != "" {
+			names = append(names, n)
+		}
+	case celast.CallKind:
+		if isComprehensionMacroName(e.AsCall().FunctionName()) {
+			args := e.AsCall().Args()
+			if len(args) > 0 && args[0].Kind() == celast.IdentKind {
+				if n := args[0].AsIdent(); n != "" {
+					names = append(names, n)
+				}
+			}
+		}
+	}
+	if len(names) == 0 {
+		return names, -1, -1
+	}
+	start = -1
+	if r, ok := info.GetOffsetRange(e.ID()); ok {
+		start = celtsource.ByteOffset(ro, int(r.Start))
+	}
+	if start < 0 || start >= len(content) {
+		return names, -1, -1
+	}
+	return names, start, macroScopeEndAt(content, start)
+}
+
+// isComprehensionMacroName reports whether name is a comprehension macro.
+func isComprehensionMacroName(name string) bool {
+	switch name {
+	case "exists", "exists_one", "all", "filter", "map":
+		return true
+	}
+	return false
+}
+
+// macroScopeEndAt returns the byte index just past the `)` balancing the `(` at
+// open, skipping strings and comments.
+func macroScopeEndAt(content string, open int) int {
+	depth := 0
+	for i := open; i < len(content); i++ {
+		switch {
+		case content[i] == '\'' || content[i] == '"':
+			i = celtsource.SkipString(content, i) - 1
+		case content[i] == '/' && i+1 < len(content) && content[i+1] == '/':
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			i--
+		case content[i] == '(':
+			depth++
+		case content[i] == ')':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(content)
 }
 
 // isMacro reports whether name is registered as a macro in the env.
@@ -207,17 +418,23 @@ func (a *Analyzer) isMacro(name string) bool {
 }
 
 // macroCallAtCursor compiles content and resolves the macro invocation whose
-// source range contains the cursor, if any.
+// source range contains the cursor, if any. The compile uses the tracking env
+// (which records macro calls) so the expansion is recoverable; the caller's
+// original env is used for all other analysis.
 func (a *Analyzer) macroCallAtCursor(content string, line, char int) (*MacroCall, bool) {
 	off, _, _, ok := celtsource.LineByteColOffset(content, line, char)
 	if !ok {
 		return nil, false
 	}
-	ast, iss := a.env.Compile(content)
+	env := a.trackEnv
+	if env == nil {
+		env = a.env
+	}
+	ast, iss := env.Compile(content)
 	if iss != nil && iss.Err() != nil {
 		return nil, false
 	}
-	return MacroCallAt(ast.NativeRep(), celtsource.RuneOffsets(content), content, a.env, off)
+	return MacroCallAt(ast.NativeRep(), celtsource.RuneOffsets(content), content, env, off)
 }
 
 func (a *Analyzer) receiverElemAt(content string, line, char int) string {
@@ -225,7 +442,6 @@ func (a *Analyzer) receiverElemAt(content string, line, char int) string {
 	if !ok {
 		return ""
 	}
-
 	i := off
 	for i > lineStart && celtsource.IsIdentByte(content[i-1]) {
 		i--
@@ -233,7 +449,6 @@ func (a *Analyzer) receiverElemAt(content string, line, char int) string {
 	if i < lineStart+1 || content[i-1] != '.' {
 		return ""
 	}
-
 	j := i - 2
 	for j >= lineStart && celtsource.IsIdentByte(content[j]) {
 		j--

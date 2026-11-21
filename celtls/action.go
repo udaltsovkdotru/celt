@@ -39,6 +39,13 @@ func FindingRange(content string, f *celtlint.Finding) protocol.Range {
 	return protocol.Range{Start: toPosition(content, start), End: toPosition(content, end)}
 }
 
+// DiagnosticRange returns the reported span of a finding in the given content.
+// This is the range presented to the user as the diagnostic, which may be wider
+// than the narrower range a fix replaces.
+func DiagnosticRange(content string, f *celtlint.Finding) protocol.Range {
+	return protocol.Range{Start: toPosition(content, f.Start), End: toPosition(content, f.End)}
+}
+
 // RangesOverlap reports whether two LSP ranges overlap.
 func RangesOverlap(a, b protocol.Range) bool {
 	return !posLess(a.End, b.Start) && !posLess(b.End, a.Start)

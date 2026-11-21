@@ -387,6 +387,47 @@ func TestSpellFieldPresence(t *testing.T) {
 	}
 }
 
+// TestSpellFieldPresenceTypeIdentity verifies presence metadata is keyed by the
+// full type name, so two types that share a short name (alpha.Person and
+// beta.Person) do not leak presence flags into each other.
+func TestSpellFieldPresenceTypeIdentity(t *testing.T) {
+	opt := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()
+	fdset := &descriptorpb.FileDescriptorSet{
+		File: []*descriptorpb.FileDescriptorProto{
+			{
+				Name: proto.String("a.proto"), Package: proto.String("alpha"), Syntax: proto.String("proto3"),
+				MessageType: []*descriptorpb.DescriptorProto{{
+					Name: proto.String("Person"),
+					Field: []*descriptorpb.FieldDescriptorProto{
+						{Name: proto.String("nickname"), Number: proto.Int32(1), Label: opt, Type: descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(), Proto3Optional: proto.Bool(true)},
+					},
+				}},
+			},
+			{
+				Name: proto.String("b.proto"), Package: proto.String("beta"), Syntax: proto.String("proto3"),
+				MessageType: []*descriptorpb.DescriptorProto{{
+					Name: proto.String("Person"),
+					Field: []*descriptorpb.FieldDescriptorProto{
+						{Name: proto.String("nickname"), Number: proto.Int32(1), Label: opt, Type: descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum()},
+					},
+				}},
+			},
+		},
+	}
+	env, err := cel.NewEnv(cel.TypeDescs(fdset))
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	ix := celtindex.Build(env, fdset)
+
+	if ix.FieldPresence("alpha.Person", "nickname")&celtindex.PresenceProto3Optional == 0 {
+		t.Error("alpha.Person.nickname: want PresenceProto3Optional")
+	}
+	if ix.FieldPresence("beta.Person", "nickname")&celtindex.PresenceProto3Optional != 0 {
+		t.Error("beta.Person.nickname: PresenceProto3Optional leaked from alpha.Person")
+	}
+}
+
 // TestSpellBuildIndexesEmpty verifies Build handles an empty env and an
 // empty descriptor set without panicking, still indexing built-in constants.
 func TestSpellBuildIndexesEmpty(t *testing.T) {

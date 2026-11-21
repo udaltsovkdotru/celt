@@ -42,12 +42,12 @@ func TestFDSummaryWarnings(t *testing.T) {
 		{
 			name: "warnings with single fixable",
 			s:    Stats{Warnings: 2, Fixable: 1},
-			want: "warning: celt generated 2 warnings (run `celt --fix` to apply 1 suggestion)\n    Finished checking 0 files",
+			want: "warning: celt generated 2 warnings (run `celt lint --fix --dir <dir>` to apply 1 suggestion)\n    Finished checking 0 files",
 		},
 		{
 			name: "warnings with plural fixable",
 			s:    Stats{Warnings: 1, Fixable: 2},
-			want: "warning: celt generated 1 warning (run `celt --fix` to apply 2 suggestions)\n    Finished checking 0 files",
+			want: "warning: celt generated 1 warning (run `celt lint --fix --dir <dir>` to apply 2 suggestions)\n    Finished checking 0 files",
 		},
 		{
 			name: "custom bin name",

@@ -243,6 +243,21 @@ func TestAnalyzeLevelOverride(t *testing.T) {
 	}
 }
 
+func TestAnalyzeFillsInUnspecifiedFindingSeverityFromRuleDefault(t *testing.T) {
+	r := &lnPlainRule{
+		RuleMeta: RuleMeta{Name: lnPlainName, Defaults: RuleParams{Level: LevelError}},
+		check:    func(ctx *Context) { ctx.Report(&Finding{Code: lnFindingCode, Message: "rule violation"}) },
+	}
+	a, err := New(lnEnv(t), WithRules(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings := a.Analyze("test.cel", "true")
+	if len(findings) != 1 || !findings[0].IsError() {
+		t.Errorf("rule's default severity is error, got %+v", findings)
+	}
+}
+
 // TestAnalyzeRuleLevelNotOverridden verifies that a rule's explicit finding
 // level is preserved when the provider does not override the rule.
 func TestAnalyzeRuleLevelNotOverridden(t *testing.T) {

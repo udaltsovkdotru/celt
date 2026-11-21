@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
 	"cel.dev/cel-go/cel"
@@ -111,5 +112,47 @@ func TestMacroTypedOverloads(t *testing.T) {
 	}
 	if got := ast.OutputType(); got != cel.BoolType {
 		t.Errorf("output type = %v, want %v", got, cel.BoolType)
+	}
+}
+
+// TestMacroRejectsMultipleResults verifies a macro with several unconstrained
+// result types is rejected with a clear validation error (CEL overloads are
+// keyed by argument signature, so they would collide at env construction).
+func TestMacroRejectsMultipleResults(t *testing.T) {
+	_, err := ParseEnv([]byte(`
+env:
+  macros:
+    - name: mm
+      vararg: true
+      results:
+        - bool
+        - string
+`))
+	if err == nil {
+		t.Fatal("ParseEnv: expected an error for multiple results, got nil")
+	}
+}
+
+// TestMacroVarArgAcceptsManyArgs verifies a vararg macro accepts calls well
+// beyond the former ten-argument cap (the documented limit is maxMacroArity).
+func TestMacroVarArgAcceptsManyArgs(t *testing.T) {
+	e, err := ParseEnv([]byte(macroEnv))
+	if err != nil {
+		t.Fatalf("ParseEnv: %v", err)
+	}
+	opts, err := e.Options()
+	if err != nil {
+		t.Fatalf("Options: %v", err)
+	}
+	env, err := cel.NewEnv(opts...)
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	args := make([]string, 20)
+	for i := range args {
+		args[i] = "1"
+	}
+	if _, iss := env.Compile("matches_any(" + strings.Join(args, ", ") + ")"); iss != nil && iss.Err() != nil {
+		t.Errorf("Compile(20 args): %v", iss.Err())
 	}
 }

@@ -136,6 +136,41 @@ func cpFindItem(items []CompletionItem, label string) (CompletionItem, bool) {
 	return CompletionItem{}, false
 }
 
+func TestCompletionSnippetMatchesReceiverOverload(t *testing.T) {
+	fdset := cpTestFDSet()
+	file := fdset.File[0]
+	file.SourceCodeInfo = nil
+	widget := file.MessageType[0]
+	widget.Field = append(widget.Field, &descriptorpb.FieldDescriptorProto{
+		Name: proto.String("numbers"), Number: proto.Int32(5),
+		Label: descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(), Type: descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum(),
+	})
+	env, err := cel.NewEnv(cel.TypeDescs(fdset), cel.Variable("w", cel.ObjectType("test.pkg.Widget")),
+		cel.Function("pick",
+			cel.MemberOverload("pick_strings", []*cel.Type{cel.ListType(cel.StringType)}, cel.StringType),
+			cel.MemberOverload("pick_numbers", []*cel.Type{cel.ListType(cel.IntType), cel.IntType}, cel.IntType),
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := New(env, WithDescriptor(fdset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		receiver string
+		snippet  bool
+	}{{receiver: "w.tags"}, {receiver: "w.numbers", snippet: true}} {
+		src := tc.receiver + ".pi"
+		items := a.Completion(src, 0, len(src))
+		item, ok := cpFindItem(items, "pick")
+		if !ok || (item.InsertTextFormat == InsertTextFormatSnippet) != tc.snippet {
+			t.Errorf("completion for %s: %+v, want argument snippet=%v", tc.receiver, items, tc.snippet)
+		}
+	}
+}
+
 // TestCompletionTopLevel verifies top-level completion surfaces variables,
 // macros, enum types and enum values that share the typed prefix, and that a
 // too-short prefix or an empty line yields no completion.

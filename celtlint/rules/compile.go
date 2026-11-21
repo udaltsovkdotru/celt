@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common"
@@ -59,7 +60,7 @@ func compileFindings(src common.Source, iss *cel.Issues, idx *celtindex.Index) [
 			End:     end,
 		}
 		if m := expectedTypeRx.FindStringSubmatch(msg); m != nil {
-			if s, ok := typedLiteralOperand(src, m[2]); ok {
+			if s, ok := typedLiteralOperand(src, m[2], compilerByteOffset(src.Content(), line, col)); ok {
 				f.Start, f.End = s.litStart, s.litEnd
 				f.SpanMessage = expectedFound(m[1], m[2])
 				if s.sibling {
@@ -124,17 +125,54 @@ func compileErrorSpan(src common.Source, e *cel.Error, line, col int) (start, en
 	content := src.Content()
 	msg := celtlint.BacktickQuotes(e.Message)
 	if m := expectedTypeRx.FindStringSubmatch(msg); m != nil {
-		if s, ok := typedLiteralOperand(src, m[2]); ok {
+		if s, ok := typedLiteralOperand(src, m[2], compilerByteOffset(content, line, col)); ok {
 			return s.litStart, s.litEnd
 		}
 	}
-	if snippet, ok := src.Snippet(line); ok {
-		if start, length := errorSpan(snippet, col, msg); length > 0 {
-			return celtlint.Position{Line: line - 1, Char: start}, celtlint.Position{Line: line - 1, Char: start + length}
-		}
+	// The compiler reports locations in LF-based, rune-based coordinates.
+	// Translate to a byte offset in the original source once; every subsequent
+	// span computation is then byte-accurate regardless of Unicode width, and
+	// the final Position conversion is CR/CRLF/Unicode aware (so e.g. a lone
+	// `\r` line terminator lands on the right line).
+	errOff := compilerByteOffset(content, line, col)
+	ls := errOff
+	for ls > 0 && content[ls-1] != '\n' {
+		ls--
 	}
-	off := celtsource.PosToOffset(content, celtlint.Position{Line: line - 1, Char: col})
-	return celtsource.OffsetToPos(content, off), celtsource.OffsetToPos(content, off+1)
+	lineLen := len(content) - ls
+	if le := strings.IndexByte(content[ls:], '\n'); le >= 0 {
+		lineLen = le
+	}
+	if s, length := errorSpan(content[ls:ls+lineLen], errOff-ls, msg); length > 0 {
+		sb := ls + s
+		return celtsource.OffsetToPos(content, sb), celtsource.OffsetToPos(content, sb+length)
+	}
+	return celtsource.OffsetToPos(content, errOff), celtsource.OffsetToPos(content, errOff+1)
+}
+
+// compilerByteOffset converts a compiler error location (LF-based 1-indexed
+// line, 0-indexed rune column within the line) into a byte offset in content.
+// The compiler counts columns in runes, so Unicode characters are accounted for
+// when advancing to the column; the result is a true byte index into content.
+func compilerByteOffset(content string, line, col int) int {
+	if line < 1 {
+		line = 1
+	}
+	off := 0
+	for l := 1; l < line; l++ {
+		nl := strings.IndexByte(content[off:], '\n')
+		if nl < 0 {
+			return len(content)
+		}
+		off += nl + 1
+	}
+	i := off
+	for col > 0 && i < len(content) && content[i] != '\n' {
+		_, size := utf8.DecodeRuneInString(content[i:])
+		i += size
+		col--
+	}
+	return i
 }
 
 var overloadRx = regexp.MustCompile("found no matching overload for `([^`]+)` applied to `\\(([^)]*)\\)`")
@@ -219,17 +257,41 @@ func isCompBoundary(c byte) bool {
 	return c == '&' || c == '|' || c == '(' || c == ')' || c == ','
 }
 
+// findTokenAt returns the start of the token occurrence that spans col, so a
+// repeated name (e.g. `missing + missing`) resolves each diagnostic to its own
+// occurrence rather than always the first one.
+func findTokenAt(snippet, token string, col int) int {
+	if token == "" {
+		return -1
+	}
+	from := 0
+	for {
+		pos := strings.Index(snippet[from:], token)
+		if pos < 0 {
+			return -1
+		}
+		abs := from + pos
+		if abs <= col && col <= abs+len(token) {
+			return abs
+		}
+		from = abs + len(token)
+		if from >= len(snippet) {
+			return -1
+		}
+	}
+}
+
 func primarySpan(snippet string, col int, msg string) (start, length int) {
 	token := celtlint.BtName(celtlint.BacktickQuotes(msg))
 	if token == "" {
 		token = celtlint.DqName(msg)
 	}
 	if token != "" {
-		if idx := strings.Index(snippet, token); idx >= 0 {
+		if idx := findTokenAt(snippet, token, col); idx >= 0 {
 			return idx, len(token)
 		}
 		if i := strings.LastIndex(token, "."); i >= 0 {
-			if idx := strings.Index(snippet, token[i+1:]); idx >= 0 {
+			if idx := findTokenAt(snippet, token[i+1:], col); idx >= 0 {
 				return idx, len(token) - i - 1
 			}
 		}

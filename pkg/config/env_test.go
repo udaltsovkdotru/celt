@@ -1,11 +1,14 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"cel.dev/cel-go/cel"
 )
+
+const envKeyType = "type"
 
 const sampleEnv = `
 env:
@@ -110,4 +113,81 @@ func TestEnvReflectsInEnv(t *testing.T) {
 	if !strings.Contains(env.Container.Name(), "example.com") {
 		t.Errorf("env.Container = %q", env.Container.Name())
 	}
+}
+
+func TestEnvRejectsMalformedTypeExpressions(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, typ string
+	}{
+		{name: "unclosed list", key: envKeyType, typ: "list<int"},
+		{name: "extra map argument", key: envKeyType, typ: "map<string,int, bool>"},
+		{name: "empty qualified name", key: envKeyType, typ: "."},
+		{name: "extra closing bracket", key: envKeyType, typ: "list<int>>"},
+		{name: "empty name component", key: envKeyType, typ: "pkg..Person"},
+		{name: "empty type_name reference", key: "type_name", typ: "."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := fmt.Appendf(nil, "env:\n  variables:\n    - name: subject\n      %s: %q\n", tc.key, tc.typ)
+			if err := envLoadError(src); err == nil {
+				t.Errorf("environment loaded with malformed type %q", tc.typ)
+			} else if !strings.Contains(err.Error(), "subject") {
+				t.Errorf("error should identify the variable subject: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnvRejectsDuplicateNativeMessageNames(t *testing.T) {
+	const src = `
+env:
+  types:
+    messages:
+      - name: native.Account
+        fields:
+          - name: id
+            type: int
+      - name: %q
+        fields:
+          - name: email
+            type: string
+`
+	for _, alias := range []string{"native.Account", ".native.Account"} {
+		t.Run(alias, func(t *testing.T) {
+			err := envLoadError(fmt.Appendf(nil, src, alias))
+			if err == nil {
+				t.Fatalf("environment loaded with conflicting declarations native.Account and %s", alias)
+			}
+			if !strings.Contains(err.Error(), "native.Account") {
+				t.Errorf("error should identify the duplicate message native.Account: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnvRejectsReceiverMacroOverloadWithoutReceiverArgument(t *testing.T) {
+	const src = `env:
+  macros:
+    - name: test
+      receiver: true
+      vararg: true
+      overloads:
+        - args: []
+          result: bool
+`
+	if err := envLoadError([]byte(src)); err == nil {
+		t.Error("environment accepted a receiver macro overload without a receiver parameter")
+	}
+}
+
+func envLoadError(src []byte) error {
+	e, err := ParseEnv(src)
+	if err != nil {
+		return err
+	}
+	opts, err := e.Options()
+	if err != nil {
+		return err
+	}
+	_, err = cel.NewEnv(opts...)
+	return err
 }

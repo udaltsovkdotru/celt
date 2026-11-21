@@ -30,6 +30,12 @@ func TestOffsetToPos(t *testing.T) {
 	}
 }
 
+func TestOffsetToPosInsideCRLFDoesNotReturnNegativeColumn(t *testing.T) {
+	if got := OffsetToPos("a\r\nb", 2); got.Char < 0 {
+		t.Errorf("offset between CR and LF gave a negative column: %+v", got)
+	}
+}
+
 func TestOffsetToPosTrailingNewline(t *testing.T) {
 	const srcTrailingContent = "ab\n"
 	srcTrailing := []struct {

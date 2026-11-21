@@ -30,7 +30,7 @@ func Summary(s Stats, binName string) string {
 	if s.Warnings > 0 {
 		msg := fmt.Sprintf("%s generated %d %s", binName, s.Warnings, plural(s.Warnings, "warning"))
 		if s.Fixable > 0 {
-			msg += fmt.Sprintf(" (run `%s --fix` to apply %d %s)",
+			msg += fmt.Sprintf(" (run `%s lint --fix --dir <dir>` to apply %d %s)",
 				binName, s.Fixable, plural(s.Fixable, "suggestion"))
 		}
 		fmt.Fprintf(&b, "%s: %s\n",

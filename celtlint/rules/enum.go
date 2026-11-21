@@ -1,7 +1,6 @@
 package rules
 
 import (
-	"fmt"
 	"strings"
 
 	"cel.dev/cel-go/cel"
@@ -15,10 +14,13 @@ import (
 	"github.com/udaltsovkdotru/celt/celtsource"
 )
 
-// enumWarning produces a Finding for a suspicious comparison, or nil.
-type enumWarning func(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index, refMap map[int64]*celast.ReferenceInfo) *celtlint.Finding
+// enumWarning produces a Finding for a suspicious comparison, or nil. env is the
+// environment, used to decide whether an emitted fix must be absolute (leading
+// dot) and to verify it resolves to the intended constant.
+type enumWarning func(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index,
+	refMap map[int64]*celast.ReferenceInfo, env *cel.Env) *celtlint.Finding
 
-func checkEnum(src common.Source, ast *cel.Ast, idx *celtindex.Index, warn enumWarning) []celtlint.Finding {
+func checkEnum(src common.Source, ast *cel.Ast, idx *celtindex.Index, env *cel.Env, warn enumWarning) []celtlint.Finding {
 	// Walk the checked native AST (which carries type info) while reading source
 	// positions from the same native AST's source info. Re-parsing or
 	// round-tripping through a proto CheckedExpr would either renumber node ids
@@ -31,10 +33,11 @@ func checkEnum(src common.Source, ast *cel.Ast, idx *celtindex.Index, warn enumW
 
 	var out []celtlint.Finding
 	WalkNavigable(celast.NavigateAST(native), func(nav celast.NavigableExpr) bool {
-		if d := warn(sp, nav, idx, refMap); d != nil {
+		if d := warn(sp, nav, idx, refMap, env); d != nil {
 			out = append(out, *d)
-			return false
 		}
+		// Keep descending so nested comparisons (e.g. inside a ternary arm) are
+		// also reported; the edit layer later drops any that overlap.
 		return true
 	})
 	return out
@@ -71,8 +74,6 @@ const (
 
 // classifyComparison inspects a comparison expression and returns its enum
 // classification plus the operands.
-//
-//nolint:gocyclo // exhaustive enum-comparison matrix, hard to flatten without hurting readability
 func classifyComparison(nav celast.NavigableExpr, idx *celtindex.Index,
 	refMap map[int64]*celast.ReferenceInfo) (kind compareKind, a, b enumOperand, args []celast.Expr) {
 	if nav.Kind() != celast.CallKind || !isComparisonOperator(nav.AsCall().FunctionName()) {
@@ -96,29 +97,29 @@ func classifyComparison(nav celast.NavigableExpr, idx *celtindex.Index,
 	if a.kind == kindOther || b.kind == kindOther {
 		return compareEnumError, a, b, args
 	}
-	if a.kind == kindVariable && b.kind == kindVariable {
-		if a.enum == b.enum {
-			return compareEnumWarn, a, b, args
-		}
-		return compareEnumError, a, b, args
-	}
-	if a.kind == kindVariable || b.kind == kindVariable {
+	// Both operands are enum-typed (variable or constant) at this point. Compare
+	// the enum types first: values from different enums are a type mismatch
+	// regardless of whether they are variables or constants, and comparing
+	// values of the same enum is only a (warn-level) odd comparison.
+	if a.enum != b.enum {
 		return compareEnumError, a, b, args
 	}
 	return compareEnumWarn, a, b, args
 }
 
 // rawEnumValueWarning reports a raw enum literal used in a comparison.
-func rawEnumValueWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index, refMap map[int64]*celast.ReferenceInfo) *celtlint.Finding {
+func rawEnumValueWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index,
+	refMap map[int64]*celast.ReferenceInfo, env *cel.Env) *celtlint.Finding {
 	kind, a, b, args := classifyComparison(nav, idx, refMap)
 	if kind != compareRawEnum {
 		return nil
 	}
-	return rawEnumWarning(sp, nav, a, b, args, idx)
+	return rawEnumWarning(sp, nav, a, b, args, idx, env)
 }
 
 // enumCompareWarning reports a suspicious but type-correct enum comparison.
-func enumCompareWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index, refMap map[int64]*celast.ReferenceInfo) *celtlint.Finding {
+func enumCompareWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index,
+	refMap map[int64]*celast.ReferenceInfo, _ *cel.Env) *celtlint.Finding {
 	kind, a, b, args := classifyComparison(nav, idx, refMap)
 	if kind != compareEnumWarn {
 		return nil
@@ -128,7 +129,8 @@ func enumCompareWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.I
 }
 
 // enumTypeMismatchWarning reports an enum comparison of mismatched types.
-func enumTypeMismatchWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index, refMap map[int64]*celast.ReferenceInfo) *celtlint.Finding {
+func enumTypeMismatchWarning(sp ExprSpans, nav celast.NavigableExpr, idx *celtindex.Index,
+	refMap map[int64]*celast.ReferenceInfo, _ *cel.Env) *celtlint.Finding {
 	kind, a, b, args := classifyComparison(nav, idx, refMap)
 	if kind != compareEnumError {
 		return nil
@@ -142,7 +144,7 @@ func rawEnumValueFindings(ctx *celtlint.Context) []celtlint.Finding {
 	if ctx.Index == nil || ctx.Ast == nil || ctx.CompileFailed() {
 		return nil
 	}
-	return checkEnum(ctx.Source, ctx.Ast, ctx.Index, rawEnumValueWarning)
+	return checkEnum(ctx.Source, ctx.Ast, ctx.Index, ctx.Env, rawEnumValueWarning)
 }
 
 // enumCompareFindings reports suspicious but valid enum comparisons.
@@ -150,7 +152,7 @@ func enumCompareFindings(ctx *celtlint.Context) []celtlint.Finding {
 	if ctx.Index == nil || ctx.Ast == nil || ctx.CompileFailed() {
 		return nil
 	}
-	return checkEnum(ctx.Source, ctx.Ast, ctx.Index, enumCompareWarning)
+	return checkEnum(ctx.Source, ctx.Ast, ctx.Index, ctx.Env, enumCompareWarning)
 }
 
 // enumTypeMismatchFindings reports enum comparisons of mismatched types.
@@ -158,7 +160,7 @@ func enumTypeMismatchFindings(ctx *celtlint.Context) []celtlint.Finding {
 	if ctx.Index == nil || ctx.Ast == nil || ctx.CompileFailed() {
 		return nil
 	}
-	return checkEnum(ctx.Source, ctx.Ast, ctx.Index, enumTypeMismatchWarning)
+	return checkEnum(ctx.Source, ctx.Ast, ctx.Index, ctx.Env, enumTypeMismatchWarning)
 }
 
 func compareWarnMessage(a, b enumOperand) string {
@@ -178,7 +180,8 @@ func compareErrorMessage(a, b enumOperand) string {
 	return "comparing enum values of different types"
 }
 
-func rawEnumWarning(sp ExprSpans, nav celast.NavigableExpr, a, b enumOperand, args []celast.Expr, idx *celtindex.Index) *celtlint.Finding {
+func rawEnumWarning(sp ExprSpans, nav celast.NavigableExpr, a, b enumOperand, args []celast.Expr,
+	idx *celtindex.Index, env *cel.Env) *celtlint.Finding {
 	// One operand is a raw integer literal and the other is enum-typed. The fix
 	// must replace the integer literal itself (not the enum operand) with the
 	// named enum value it corresponds to, so enumSide is the literal's operand.
@@ -199,10 +202,30 @@ func rawEnumWarning(sp ExprSpans, nav celast.NavigableExpr, a, b enumOperand, ar
 	var fixStart, fixEnd celtlint.Position
 	var fix string
 	if member, hasMember := idx.EnumValues(enumFull)[val]; hasMember {
-		fix = fmt.Sprintf("%s.%s", idx.EnumShort(enumFull), member)
-		if s, e := celtlint.ExprOffsets(sp.info, sp.ro, sp.content, enumSide); e > s {
-			fixStart = celtsource.OffsetToPos(sp.content, s)
-			fixEnd = celtsource.OffsetToPos(sp.content, e)
+		// Use the fully-qualified enum name so the fix resolves regardless of
+		// the configured container (a bare short name would only resolve when
+		// the enum is already in scope, and would otherwise produce an
+		// undeclared reference). When a container is set, a non-absolute name
+		// would be re-resolved relative to it (test.Status.ACTIVE under
+		// container prod -> prod.test.Status.ACTIVE), so emit a leading dot to
+		// pin it to the intended constant.
+		name := enumFull + "." + member
+		if env != nil && env.Container.Name() != "" {
+			name = "." + name
+		}
+		// A container or abbreviation can still redirect a qualified name (an
+		// abbreviation "prod.test" maps test.Status.ACTIVE to
+		// prod.test.Status.ACTIVE). Only emit the fix if it actually resolves
+		// to the intended constant (by reference, not just by value, so a
+		// shadowed same-value constant is not substituted); otherwise withhold
+		// the edit but keep reporting the raw-enum finding so the author fixes
+		// it by hand.
+		if enumFixResolves(env, name, enumFull+"."+member, val) {
+			fix = name
+			if s, e := celtlint.ExprOffsets(sp.info, sp.ro, sp.content, enumSide); e > s {
+				fixStart = celtsource.OffsetToPos(sp.content, s)
+				fixEnd = celtsource.OffsetToPos(sp.content, e)
+			}
 		}
 	}
 	return &celtlint.Finding{
@@ -216,6 +239,50 @@ func rawEnumWarning(sp ExprSpans, nav celast.NavigableExpr, a, b enumOperand, ar
 		FixStart: fixStart,
 		FixEnd:   fixEnd,
 	}
+}
+
+// enumFixResolves reports whether the candidate fix expression compiles in env
+// and resolves to the intended constant: the checked AST must contain a
+// reference to wantRef that evaluates to wantVal. A configured container or
+// abbreviation can redirect a qualified name (an abbreviation "prod.test" makes
+// test.Status.ACTIVE resolve to prod.test.Status.ACTIVE), so a fix must be
+// verified against the constant it would actually name, not just its value.
+func enumFixResolves(env *cel.Env, candidate, wantRef string, want int64) bool {
+	if env == nil {
+		return false
+	}
+	ast, iss := env.Compile(candidate)
+	if iss != nil && iss.Err() != nil {
+		return false
+	}
+	if ast == nil {
+		return false
+	}
+	resolved := false
+	for _, ref := range ast.NativeRep().ReferenceMap() {
+		if ref.Name == wantRef {
+			resolved = true
+			break
+		}
+	}
+	if !resolved {
+		return false
+	}
+	prg, err := env.Program(ast)
+	if err != nil {
+		return false
+	}
+	out, _, err := prg.Eval(cel.NoVars())
+	if err != nil {
+		return false
+	}
+	switch v := out.Value().(type) {
+	case int64:
+		return v == want
+	case celtypes.Int:
+		return int64(v) == want
+	}
+	return false
 }
 
 const (
@@ -352,7 +419,7 @@ type typedLiteralSpan struct {
 	sibling          bool
 }
 
-func typedLiteralOperand(src common.Source, found string) (typedLiteralSpan, bool) {
+func typedLiteralOperand(src common.Source, found string, errOff int) (typedLiteralSpan, bool) {
 	parsed := celtlint.ParseUnexpanded(src)
 	if parsed == nil {
 		return typedLiteralSpan{}, false
@@ -362,10 +429,8 @@ func typedLiteralOperand(src common.Source, found string) (typedLiteralSpan, boo
 	ro := celtsource.RuneOffsets(content)
 	matched := false
 	var out typedLiteralSpan
+	bestDist := -1
 	WalkNavigable(celast.NavigateAST(parsed), func(nav celast.NavigableExpr) bool {
-		if matched {
-			return false
-		}
 		if nav.Kind() == celast.CallKind {
 			args := nav.AsCall().Args()
 			if _, isOp := operators.FindReverse(nav.AsCall().FunctionName()); isOp {
@@ -374,8 +439,21 @@ func typedLiteralOperand(src common.Source, found string) (typedLiteralSpan, boo
 						continue
 					}
 					s, e := celtlint.ExprOffsets(sInfo, ro, content, arg)
+					// Localize to the compiler's reported location: a type
+					// mismatch names the offending operand, so the relevant
+					// literal is the one nearest the error offset, not the first
+					// compatible literal anywhere in the expression.
+					dist := s - errOff
+					if dist < 0 {
+						dist = -dist
+					}
+					if matched && dist >= bestDist {
+						continue
+					}
+					bestDist = dist
 					out.litStart = celtsource.OffsetToPos(content, s)
 					out.litEnd = celtsource.OffsetToPos(content, e)
+					out.sibling = false
 					if len(args) == 2 {
 						os, oe := celtlint.ExprOffsets(sInfo, ro, content, args[1-i])
 						out.sibStart = celtsource.OffsetToPos(content, os)
@@ -383,7 +461,6 @@ func typedLiteralOperand(src common.Source, found string) (typedLiteralSpan, boo
 						out.sibling = true
 					}
 					matched = true
-					return false
 				}
 			}
 		}

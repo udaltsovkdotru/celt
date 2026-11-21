@@ -1,6 +1,7 @@
 package celtlint
 
 import (
+	"strings"
 	"testing"
 
 	"cel.dev/cel-go/cel"
@@ -116,9 +117,65 @@ func TestMacroSpanSkipsStringLiteral(t *testing.T) {
 	}
 }
 
-// TestMacroCallAtEndExclusive verifies the End boundary is exclusive: a cursor
-// exactly at End (just past the closing paren) is not inside the call, while
-// the last character is.
+func TestMacroCallSpanIncludesNameAndSkipsComments(t *testing.T) {
+	env := testMacroEnv(t)
+	for _, content := range []string{
+		`matches_any  ("a")`,
+		"matches_any(\"a\", // ) is comment text\n \"b\")",
+		"has // comment before arguments\n ({'a': 1}.a)",
+	} {
+		t.Run(content, func(t *testing.T) {
+			ast, issues := env.Compile(content)
+			if err := issues.Err(); err != nil {
+				t.Fatalf("invalid macro call fixture: %v", err)
+			}
+			calls := MacroCallsIn(ast.NativeRep(), celtsource.RuneOffsets(content), content, env)
+			if len(calls) != 1 || calls[0].Offset != 0 || calls[0].End != len(content) {
+				t.Errorf("macro call span should cover bytes [0,%d): %+v", len(content), calls)
+			}
+		})
+	}
+}
+
+func TestMacroCallSpanIgnoresSlashesInsidePrecedingString(t *testing.T) {
+	env := testMacroEnv(t)
+	const content = `"https://x" == "x" && matches_any("a")`
+	ast, issues := env.Compile(content)
+	if err := issues.Err(); err != nil {
+		t.Fatal(err)
+	}
+	native := ast.NativeRep()
+	ro := celtsource.RuneOffsets(content)
+	calls := MacroCallsIn(native, ro, content, env)
+	want := strings.Index(content, "matches_any")
+	if len(calls) != 1 || calls[0].Offset != want || calls[0].End != len(content) {
+		t.Errorf("expected exactly one macro span [%d,%d): %+v", want, len(content), calls)
+	}
+	if call, ok := MacroCallAt(native, ro, content, env, 0); ok {
+		t.Errorf("preceding string was mistaken for part of the macro call: %+v", call)
+	}
+}
+
+func TestReceiverMacroDoesNotReportOriginalCallAsExpansion(t *testing.T) {
+	env, err := cel.NewEnv(cel.EnableMacroCallTracking())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const content = "[1,2].all(x,x>0)"
+	ast, issues := env.Compile(content)
+	if err := issues.Err(); err != nil {
+		t.Fatal(err)
+	}
+	calls := MacroCallsIn(ast.NativeRep(), celtsource.RuneOffsets(content), content, env)
+	if len(calls) != 1 || calls[0].Name != "all" {
+		t.Fatalf("expected tracked all call: %+v", calls)
+	}
+	expansion := strings.Join(strings.Fields(calls[0].Expansion), "")
+	if expansion == strings.TrimPrefix(content, "[1,2].") || expansion == content {
+		t.Errorf("reported original source, not an expansion: %q", calls[0].Expansion)
+	}
+}
+
 func TestMacroCallAtEndExclusive(t *testing.T) {
 	env := testMacroEnv(t)
 	content := `matches_any("a", "b")`

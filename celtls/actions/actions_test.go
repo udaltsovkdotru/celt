@@ -118,6 +118,30 @@ var (
 	acFindingEnd   = celtlint.Position{Line: 0, Char: 12}
 )
 
+func TestQuickFixAvailableWithinDiagnosticOutsideEdit(t *testing.T) {
+	const src = "p.status == 1"
+	got := newQuickFixAction().Apply(celtls.ActionContext{
+		URI:     acURI,
+		Content: src,
+		Range:   protocol.Range{Start: protocol.Position{Character: 2}, End: protocol.Position{Character: 3}},
+		Findings: []celtlint.Finding{{
+			Code: celtlint.CodeRawEnumValue, Message: "use of a raw enum value",
+			End: celtlint.Position{Char: len(src)}, Fix: "test.Status.ACTIVE",
+			FixStart: celtlint.Position{Char: len(src) - 1}, FixEnd: celtlint.Position{Char: len(src)},
+		}},
+	})
+	if len(got) != 1 {
+		t.Fatalf("expected a quick fix within the diagnostic range, got %+v", got)
+	}
+	if got[0].Edit == nil {
+		t.Fatal("quick fix has no edit")
+	}
+	edits := got[0].Edit.Changes[acURI]
+	if len(edits) != 1 || edits[0].Range.Start.Character != uint32(len(src)-1) {
+		t.Errorf("fix should replace the numeric operand: %+v", edits)
+	}
+}
+
 func TestQuickFixActionApply(t *testing.T) {
 	act := newQuickFixAction()
 

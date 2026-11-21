@@ -12,6 +12,7 @@ import (
 	"go.lsp.dev/protocol"
 
 	"github.com/udaltsovkdotru/celt/celtfmt"
+	"github.com/udaltsovkdotru/celt/celtfmt/rules"
 	"github.com/udaltsovkdotru/celt/celtlint"
 )
 
@@ -201,6 +202,30 @@ func TestServerCompletionUnknownURI(t *testing.T) {
 	}
 }
 
+type lsPlaceholderAnalyzer struct{ Analyzer }
+
+func (lsPlaceholderAnalyzer) Completion(_ string, _, _ int) []celtlint.CompletionItem {
+	return []celtlint.CompletionItem{{
+		Label: "join", InsertText: "join(${1:separator}, $2)$0", InsertTextFormat: celtlint.InsertTextFormatSnippet,
+	}}
+}
+
+func TestPlainCompletionDoesNotExposeSnippetPlaceholders(t *testing.T) {
+	s := New(lsPlaceholderAnalyzer{})
+	s.docs[lsTestURI.String()] = "jo"
+	reply, got := lsCapture()
+	if err := s.completion(t.Context(), reply, json.RawMessage(`{"textDocument":{"uri":"file:///test.cel"},"position":{"line":0,"character":2}}`)); err != nil || got.err != nil {
+		t.Fatalf("completion: %v; reply: %v", err, got.err)
+	}
+	items, ok := got.result.([]protocol.CompletionItem)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected one completion: %+v", got.result)
+	}
+	if it := items[0]; it.InsertTextFormat == protocol.InsertTextFormatSnippet || strings.Contains(it.InsertText, "$") {
+		t.Errorf("client without snippet support received snippet syntax: %+v", it)
+	}
+}
+
 func TestServerFormattingKnownURI(t *testing.T) {
 	s := New(lsNewAnalyzer(t))
 	s.docs[string(lsTestURI)] = "1 + 2"
@@ -326,6 +351,13 @@ func TestDocFormat(t *testing.T) {
 	})
 }
 
+func TestFullDocRangeAcceptsCarriageReturnLineEnding(t *testing.T) {
+	end := FullDocRange("true\r&& false").End
+	if want := (protocol.Position{Line: 1, Character: 8}); end != want {
+		t.Errorf("end position = %+v, want %+v", end, want)
+	}
+}
+
 func TestFullDocRange(t *testing.T) {
 	t.Run("singleLine", func(t *testing.T) {
 		rng := FullDocRange("1 + 2")
@@ -361,13 +393,13 @@ func (lsFakeRule) Rewrite(a *celast.AST) (*celast.AST, error) { return a, nil }
 func TestIndentOverride(t *testing.T) {
 	base := lsFakeCfg{rules: []celtfmt.FormatRule{lsFakeRule{}}}
 	o := indentOverride{base: base, indent: "    "}
-	rules := o.Rules()
-	if len(rules) != 2 {
-		t.Fatalf("len(rules) = %d, want base + indent rules", len(rules))
+	rs := o.Rules()
+	if len(rs) != 2 {
+		t.Fatalf("len(rules) = %d, want base + indent rules", len(rs))
 	}
-	ir, ok := rules[len(rules)-1].(celtfmt.IndentProvider)
+	ir, ok := rs[len(rs)-1].(celtfmt.IndentProvider)
 	if !ok {
-		t.Fatalf("last rule = %T, want an IndentProvider", rules[len(rules)-1])
+		t.Fatalf("last rule = %T, want an IndentProvider", rs[len(rs)-1])
 	}
 	if ir.Indent() != "    " {
 		t.Errorf("Indent() = %q, want 4 spaces", ir.Indent())
@@ -378,5 +410,52 @@ func TestIndentOverrideNilBase(t *testing.T) {
 	o := indentOverride{indent: "\t"}
 	if got := len(o.Rules()); got != 1 {
 		t.Errorf("len(Rules()) = %d, want 1 with nil base", got)
+	}
+}
+
+// lsRuleCfg is a Config with per-rule enablement, mirroring a config file's
+// fmt section.
+type lsRuleCfg struct {
+	rules   []celtfmt.FormatRule
+	enabled map[string]bool
+}
+
+func (c lsRuleCfg) Rules() []celtfmt.FormatRule { return c.rules }
+func (c lsRuleCfg) Enabled(name string) (enabled, ok bool) {
+	v, ok := c.enabled[name]
+	return v, ok
+}
+func (lsRuleCfg) Raw(_ string) ([]byte, bool) { return nil, false }
+
+func TestIndentOverrideKeepsExplicitRulesFromPlainConfig(t *testing.T) {
+	cfg := lsFakeCfg{rules: []celtfmt.FormatRule{rules.NewBreakOperatorsRule()}}
+	const src = "a && b"
+	want, err := celtfmt.Format(src, cfg)
+	if err != nil || !strings.Contains(strings.TrimSuffix(want, "\n"), "\n") {
+		t.Fatalf("plain config should explicitly enable the break rule: %q, %v", want, err)
+	}
+	edit, err := DocFormat(src, protocol.FormattingOptions{InsertSpaces: true, TabSize: 4}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edit == nil || !strings.Contains(strings.TrimSuffix(edit.NewText, "\n"), "\n") {
+		t.Errorf("editor indentation must not disable an explicitly supplied break rule: %+v", edit)
+	}
+}
+
+// TestIndentOverridePreservesRuleConfig verifies that applying an editor
+// indentation override does not re-enable a format rule the config disabled
+// (e.g. fmt.break-operators: false).
+func TestIndentOverridePreservesRuleConfig(t *testing.T) {
+	cfg := lsRuleCfg{
+		rules:   []celtfmt.FormatRule{rules.NewBreakOperatorsRule()},
+		enabled: map[string]bool{"break-operators": false},
+	}
+	edit, err := DocFormat("a && b && c", protocol.FormattingOptions{InsertSpaces: true, TabSize: 2}, cfg)
+	if err != nil {
+		t.Fatalf("DocFormat: %v", err)
+	}
+	if edit == nil || edit.NewText != "a && b && c\n" {
+		t.Errorf("DocFormat with fmt.break-operators: false broke operators; got %+v", edit)
 	}
 }

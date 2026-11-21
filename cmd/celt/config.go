@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/udaltsovkdotru/celt/celtfmt"
 	fmtrules "github.com/udaltsovkdotru/celt/celtfmt/rules"
 	"github.com/udaltsovkdotru/celt/celtlint"
+	lintrules "github.com/udaltsovkdotru/celt/celtlint/rules"
 	configenv "github.com/udaltsovkdotru/celt/pkg/config"
 )
 
@@ -32,6 +34,30 @@ var severityNames = map[string]celtlint.Level{
 	"warn":  celtlint.LevelWarn,
 	"error": celtlint.LevelError,
 }
+
+// knownLintRules is the set of rule names the config file may configure,
+// derived from the built-in lint rules so a mistyped name is rejected rather
+// than silently ignored.
+var knownLintRules = func() map[string]bool {
+	m := map[string]bool{}
+	for _, r := range lintrules.All() {
+		m[r.Meta().Name] = true
+	}
+	return m
+}()
+
+// configurableLintRules is the set of lint rules that accept custom
+// configuration, so a settings block under a non-configurable rule (which
+// would otherwise ignore it) is rejected instead of silently unapplied.
+var configurableLintRules = func() map[string]bool {
+	m := map[string]bool{}
+	for _, r := range lintrules.All() {
+		if _, ok := r.(celtlint.Configurable); ok {
+			m[r.Meta().Name] = true
+		}
+	}
+	return m
+}()
 
 // fileConfig is the on-disk YAML shape.
 type fileConfig struct {
@@ -105,9 +131,10 @@ func (c *config) Raw(name string) ([]byte, bool) {
 
 // loadConfig loads settings from the first config file found (or defaults if
 // none present) into a single *config that implements celtfmt.Config and
-// celtlint.ConfigProvider.
-func loadConfig() (*config, error) {
-	path := findConfig()
+// celtlint.ConfigProvider. startDir is the directory to begin the upward search
+// from; an empty string means the process working directory.
+func loadConfig(startDir string) (*config, error) {
+	path := findConfig(startDir)
 	cfg := &config{lint: map[string]lintRuleCfg{}}
 	if path == "" {
 		return cfg, nil
@@ -123,6 +150,30 @@ func loadConfig() (*config, error) {
 }
 
 func (c *config) parse(data []byte) error {
+	// A second YAML document would be silently ignored by yaml.Unmarshal,
+	// letting an unknown key in it slip past validation. The config format
+	// holds a single document, so reject any additional one.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var docCount int
+	for {
+		var doc any
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+		docCount++
+		if docCount > 1 {
+			return fmt.Errorf("parse config: multiple YAML documents are not supported")
+		}
+	}
+	// Reject unknown top-level sections (e.g. "linnt") so a mistyped key does
+	// not leave intended settings silently unapplied.
+	if err := rejectUnknownKeys(data, map[string]bool{"fmt": true, "lint": true, "env": true}, "config"); err != nil {
+		return err
+	}
 	var file fileConfig
 	if err := yaml.Unmarshal(data, &file); err != nil {
 		return fmt.Errorf("parse config: %w", err)
@@ -189,6 +240,14 @@ func (c *config) parseFmtRule(name string, node *yaml.Node) error {
 }
 
 func (c *config) parseLintRule(name string, node *yaml.Node) error {
+	// Dereference a YAML alias so a severity shared via an anchor (e.g.
+	// `misspell: *sev`) is seen as its scalar value rather than an alias node.
+	for node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	if !knownLintRules[name] {
+		return fmt.Errorf("lint.%s: unknown lint rule", name)
+	}
 	rc := lintRuleCfg{}
 	// Support the shorthand <name>: <severity>, keeping default config.
 	if node.Kind == yaml.ScalarNode {
@@ -202,27 +261,23 @@ func (c *config) parseLintRule(name string, node *yaml.Node) error {
 		c.lint[name] = rc
 		return nil
 	}
-	// Full form: a mapping with level and optional custom config.
-	var raw bytes.Buffer
-	enc := yaml.NewEncoder(&raw)
-	enc.SetIndent(2)
-	if err := enc.Encode(node); err != nil {
+	// Full form: a mapping with level and optional custom config. Decode the
+	// node in the original document's anchor context so YAML aliases (e.g.
+	// `lint: {compile: &sev error, misspell: *sev}`) resolve; re-encoding the
+	// raw node before decoding would drop the anchor definitions and fail on
+	// the alias.
+	var m map[string]any
+	if err := node.Decode(&m); err != nil {
 		return fmt.Errorf("lint.%s: %w", name, err)
 	}
-	if err := enc.Close(); err != nil {
-		return fmt.Errorf("lint.%s: %w", name, err)
-	}
-	rc.raw = raw.Bytes()
-
-	var m map[string]yaml.Node
-	if err := yaml.Unmarshal(rc.raw, &m); err != nil {
-		return fmt.Errorf("lint.%s: %w", name, err)
-	}
-	if lvlNode, ok := m["level"]; ok {
-		sev := strings.TrimSpace(lvlNode.Value)
-		lvl, ok := severityNames[sev]
+	if lvlVal, ok := m["level"]; ok {
+		lvlStr, ok := lvlVal.(string)
 		if !ok {
-			return fmt.Errorf("lint.%s: unknown severity %q", name, sev)
+			return fmt.Errorf("lint.%s: level must be a severity name", name)
+		}
+		lvl, ok := severityNames[strings.TrimSpace(lvlStr)]
+		if !ok {
+			return fmt.Errorf("lint.%s: unknown severity %q", name, lvlStr)
 		}
 		rc.level = lvl
 		rc.hasLevel = true
@@ -234,35 +289,57 @@ func (c *config) parseLintRule(name string, node *yaml.Node) error {
 	if len(m) == 0 {
 		rc.raw = nil
 	} else {
-		rc.raw = stripKey(rc.raw, "level")
+		// A rule that cannot consume custom settings must reject them here;
+		// otherwise they would be silently ignored. Name the offending key.
+		if !configurableLintRules[name] {
+			keys := sortedKeys(m)
+			return fmt.Errorf("lint.%s: unknown config key %q", name, keys[0])
+		}
+		// Re-encode the resolved (alias-expanded) mapping so the rule receives
+		// valid, self-contained config.
+		resolved, err := yaml.Marshal(m)
+		if err != nil {
+			return fmt.Errorf("lint.%s: %w", name, err)
+		}
+		rc.raw = resolved
 	}
 	c.lint[name] = rc
 	return nil
 }
 
-// stripKey re-marshals a YAML mapping without the given key.
-func stripKey(data []byte, key string) []byte {
+// rejectUnknownKeys reports the first top-level key of data that is not in
+// known, so a misspelled section is rejected rather than ignored.
+func rejectUnknownKeys(data []byte, known map[string]bool, ctx string) error {
 	var m map[string]yaml.Node
 	if err := yaml.Unmarshal(data, &m); err != nil {
-		return data
+		return nil // the structured decode below reports the parse error
 	}
-	delete(m, key)
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(m); err != nil {
-		return data
+	for k := range m {
+		if !known[k] {
+			return fmt.Errorf("%s: unknown key %q", ctx, k)
+		}
 	}
-	if err := enc.Close(); err != nil {
-		return data
-	}
-	return buf.Bytes()
+	return nil
 }
 
-func findConfig() string {
-	dir, err := os.Getwd()
-	if err != nil {
-		return ""
+// findConfig searches upward from startDir (the process working directory when
+// empty) for the first project config file.
+func findConfig(startDir string) string {
+	dir := startDir
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			return ""
+		}
+	} else if !filepath.IsAbs(dir) {
+		// Resolve a relative start directory against the working directory so
+		// the upward walk reaches the project root instead of stopping at ".".
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return ""
+		}
+		dir = abs
 	}
 	for {
 		for _, name := range configFileNames {
@@ -298,11 +375,6 @@ func runFormat(args []string) int {
 		return helpExit(err)
 	}
 
-	cfg, err := loadConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "format: %v\n", err)
-		return 1
-	}
 	if *write && *check {
 		fmt.Fprintln(os.Stderr, "format: --write and --check are mutually exclusive")
 		fs.Usage()
@@ -323,20 +395,8 @@ func runFormat(args []string) int {
 	status := 0
 	dirty := 0
 	for _, f := range files {
-		src, rerr := readInput(f)
-		if rerr != nil {
-			fmt.Fprintf(os.Stderr, "format: %s: %v\n", f, rerr)
-			status = 1
-			continue
-		}
-
-		effMode := mode
-		if f == "-" {
-			effMode = formatPrint
-		}
-		wasDirty, ferr := formatFile(f, src, cfg, effMode)
-		if ferr != nil {
-			fmt.Fprintf(os.Stderr, "format: %s: %v\n", f, ferr)
+		wasDirty, err := formatOneFile(f, mode)
+		if err != nil {
 			status = 1
 			continue
 		}
@@ -346,10 +406,43 @@ func runFormat(args []string) int {
 		}
 	}
 	if dirty > 0 {
-		fmt.Fprintf(os.Stderr, "format: %d file(s) not formatted\n", dirty)
-		return 1
+		// --check reports files that need formatting and exits 1.
+		if mode == formatCheck {
+			fmt.Fprintf(os.Stderr, "format: %d file(s) not formatted\n", dirty)
+			return 1
+		}
+		// --write reports files it rewrote as a successful operation (exit 0).
+		fmt.Fprintf(os.Stderr, "format: %d file(s) rewritten\n", dirty)
 	}
 	return status
+}
+
+// formatOneFile formats a single file (or stdin) in the given mode, returning
+// whether it was dirty and any error (already reported to stderr).
+func formatOneFile(f string, mode formatMode) (wasDirty bool, err error) {
+	if f == "-" && mode == formatWrite {
+		// Reject before reading stdin: there is no file to write on stdin,
+		// and waiting on an open stdin would hang the command.
+		fmt.Fprintln(os.Stderr, "format: -: --write requires a file, not stdin")
+		return false, errors.New("stdin write not supported")
+	}
+	// Resolve the format config from the target file's project, not the
+	// launch directory, so an absolute path formatted from a parent uses
+	// the same style as when launched from the project. Stdin uses the
+	// working directory. The applicable config's validation errors must
+	// surface before any file is written and before stdin is read, so an
+	// invalid config is reported without blocking on an open stdin pipe.
+	fileCfg, ferr := loadConfig(filepath.Dir(f))
+	if ferr != nil {
+		fmt.Fprintf(os.Stderr, "format: %s: %v\n", f, ferr)
+		return false, ferr
+	}
+	src, rerr := readInput(f)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "format: %s: %v\n", f, rerr)
+		return false, rerr
+	}
+	return formatFile(f, src, fileCfg, mode)
 }
 
 func readInput(f string) ([]byte, error) {
@@ -374,7 +467,11 @@ func formatFile(f string, src []byte, cfg celtfmt.Config, mode formatMode) (wasD
 		}
 		return false, nil
 	default:
-		fmt.Print(formatted)
+		// Report a failed stdout write (e.g. redirected to a full device) as an
+		// error rather than claiming success with no output produced.
+		if _, werr := fmt.Print(formatted); werr != nil {
+			return false, fmt.Errorf("write stdout: %w", werr)
+		}
 		return false, nil
 	}
 }

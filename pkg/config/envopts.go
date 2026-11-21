@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"strings"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common"
@@ -55,19 +54,24 @@ func (e *Env) Options() ([]cel.EnvOption, error) {
 		}
 		opts = append(opts, o...)
 	}
-	// Track macro expansions only when macros are declared, so environments
-	// without macros don't pay the tracking overhead.
-	if len(e.Macros) > 0 {
-		opts = append(opts, cel.EnableMacroCallTracking())
-	}
+	// Track macro call expansions. This must be enabled even when no custom
+	// macros are declared: built-in macros (exists, all, has, ...) are tracked
+	// too, so their hover can render the expansion independently of whether a
+	// custom macro happens to be registered.
+	opts = append(opts, cel.EnableMacroCallTracking())
 	return opts, nil
 }
 
 // variableType resolves a variable's CEL type from either a type expression or
-// a type_name reference.
+// a type_name reference. Both are validated (type_name bypasses parseType, so
+// it routes through the same object-name validation).
 func variableType(v Variable) (*cel.Type, error) {
 	if v.TypeName != "" {
-		return cel.ObjectType(strings.TrimPrefix(v.TypeName, ".")), nil
+		t, err := parseObjectType(v.TypeName)
+		if err != nil {
+			return nil, fmt.Errorf("env.variables[%q]: %w", v.Name, err)
+		}
+		return t, nil
 	}
 	t, err := parseType(v.Type)
 	if err != nil {
@@ -139,8 +143,10 @@ func functionOption(fn Function) (cel.EnvOption, error) {
 // maxMacroArity caps the synthetic function overload arities generated for
 // vararg macros, whose arity cel-go's fixed-arity function model cannot
 // otherwise represent. Arguments are unconstrained, so a bounded set of
-// all-dyn overloads lets any observed call type-check.
-const maxMacroArity = 10
+// all-dyn overloads lets any observed call type-check up to this many
+// arguments. This is the documented vararg limit: a call with more than
+// maxMacroArity arguments has no matching overload.
+const maxMacroArity = 32
 
 // macroOptions builds a signature-only macro. A cel.Macro makes the parser
 // accept the call (and surfaces it in completion, hover and misspell) without

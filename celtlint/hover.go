@@ -13,6 +13,7 @@ import (
 
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 
+	"github.com/udaltsovkdotru/celt/celtfmt"
 	"github.com/udaltsovkdotru/celt/celtindex"
 	"github.com/udaltsovkdotru/celt/celtsource"
 )
@@ -177,6 +178,16 @@ func (h *HoverDocs) Lookup(name, receiverElem string) string {
 	return ""
 }
 
+// fieldFor returns the hover doc for a field of a specific receiver type,
+// disambiguating fields that share a bare name across different messages.
+func (h *HoverDocs) fieldFor(typeName, name string) (hoverDoc, bool) {
+	if typeName == "" {
+		return hoverDoc{}, false
+	}
+	d, ok := h.fields[typeName+"."+name]
+	return d, ok
+}
+
 func renderFuncHover(d funcDoc, receiverElem string) string {
 	overloads := filterOverloads(d.overloads, receiverElem)
 	sigs := make([]string, 0, len(overloads))
@@ -195,8 +206,9 @@ func markdownCode(sig, desc string) string {
 }
 
 // renderMacroCallHover renders a macro invocation: its result type, the
-// macro's description, and (when it has a distinct textual form) its expansion.
-func renderMacroCallHover(mc *MacroCall, desc string) string {
+// macro's description, and (when it has a distinct textual form) its expansion
+// formatted with the celtfmt config.
+func renderMacroCallHover(mc *MacroCall, desc string, cfg celtfmt.Config) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "macro %#q", mc.Name)
 	if mc.ResultType != "" && mc.ResultType != dynTypeName {
@@ -209,10 +221,23 @@ func renderMacroCallHover(mc *MacroCall, desc string) string {
 	if mc.Expansion != "" {
 		b.WriteString("\n\nexpands to:\n")
 		b.WriteString("```cel\n")
-		b.WriteString(mc.Expansion)
+		b.WriteString(formatMacroExpansion(mc.Expansion, cfg))
 		b.WriteString("\n```")
 	}
 	return b.String()
+}
+
+// formatMacroExpansion pretty-prints a macro's desugared CEL with the given
+// celtfmt config, falling back to the raw unparsed form when the formatter
+// cannot handle it (e.g. a construct it does not yet preserve).
+func formatMacroExpansion(expansion string, cfg celtfmt.Config) string {
+	if expansion == "" {
+		return expansion
+	}
+	if formatted, err := celtfmt.FormatExpr(expansion, cfg); err == nil && formatted != "" {
+		return formatted
+	}
+	return expansion
 }
 
 func filterOverloads(overloads []funcOverload, receiverElem string) []funcOverload {
@@ -342,23 +367,33 @@ func fieldDocs(fdset *descriptorpb.FileDescriptorSet) map[string]hoverDoc {
 	docs := map[string]hoverDoc{}
 	for _, f := range fdset.GetFile() {
 		locations := f.GetSourceCodeInfo().GetLocation()
-		if len(locations) == 0 {
-			continue
-		}
+		// Comments are optional metadata: fields are indexed even when the file
+		// has no SourceCodeInfo, so the descriptor's field types are always
+		// available for a signature. Only the documentation is empty then.
 		for mi, msg := range f.GetMessageType() {
-			indexMessageFields(docs, locations, []int32{fileMessageType, int32(mi)}, msg)
+			indexMessageFields(docs, locations, []int32{fileMessageType, int32(mi)}, fullMessageName(f.GetPackage(), msg), msg)
 		}
 	}
 	return docs
 }
 
+// fullMessageName returns the fully-qualified message name (package plus any
+// nesting prefixes), normalized to strip a leading dot, matching how the env's
+// type provider names the type.
+func fullMessageName(pkg string, m *descriptorpb.DescriptorProto) string {
+	return strings.TrimPrefix(pkg+"."+m.GetName(), ".")
+}
+
 // indexMessageFields indexes a message's fields and, recursively, the fields
 // of its nested messages, so hover works for fields defined inside messages as
-// well as at the top level.
+// well as at the top level. Each field is keyed by both its full type-qualified
+// name ("Type.field") and its bare name, so a receiver type disambiguates
+// colliding field names while bare-name lookups still resolve.
 func indexMessageFields(
 	docs map[string]hoverDoc,
 	locations []*descriptorpb.SourceCodeInfo_Location,
 	prefix []int32,
+	fullName string,
 	m *descriptorpb.DescriptorProto,
 ) {
 	fields := m.GetField()
@@ -372,10 +407,12 @@ func indexMessageFields(
 			sig += "\n    // ..."
 		}
 		sig += "\n}"
-		docs[fld.GetName()] = hoverDoc{sig: sig, desc: desc}
+		d := hoverDoc{sig: sig, desc: desc}
+		docs[fullName+"."+fld.GetName()] = d
+		docs[fld.GetName()] = d
 	}
 	for ni, nm := range m.GetNestedType() {
-		indexMessageFields(docs, locations, appendPath(prefix, msgNestedType, int32(ni)), nm)
+		indexMessageFields(docs, locations, appendPath(prefix, msgNestedType, int32(ni)), fullName+"."+nm.GetName(), nm)
 	}
 }
 

@@ -23,7 +23,10 @@ func (quickFixAction) Apply(ctx celtls.ActionContext) []protocol.CodeAction {
 			continue
 		}
 		fRange := celtls.FindingRange(ctx.Content, f)
-		if !celtls.RangesOverlap(ctx.Range, fRange) {
+		// Availability is decided by the diagnostic range the user sees (the
+		// cursor inside the reported finding qualifies), while the edit uses
+		// the narrower replacement range.
+		if !celtls.RangesOverlap(ctx.Range, celtls.DiagnosticRange(ctx.Content, f)) {
 			continue
 		}
 		out = append(out, protocol.CodeAction{

@@ -4,8 +4,22 @@ import (
 	"strings"
 	"testing"
 
+	"cel.dev/cel-go/common"
 	celast "cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/operators"
+	"cel.dev/cel-go/common/types"
+	celref "cel.dev/cel-go/common/types/ref"
+
+	"github.com/udaltsovkdotru/celt/celtsource"
+)
+
+// Comment literals reused across format test tables.
+const (
+	cmtTail      = "// tail"
+	cmtNote      = "// note"
+	cmtOnly      = "//"
+	cmtImportant = "// important"
+	cmtInner     = "// inner"
 )
 
 // ---- test rule implementations -------------------------------------------
@@ -97,11 +111,6 @@ func TestFormatLeadingDoc(t *testing.T) {
 			name: "multiple comments with blank gap",
 			src:  "// line one\n// line two\n\nbar(1)",
 			want: "// line one\n// line two\n\nbar(1)\n",
-		},
-		{
-			name: "trailing comment after expression is dropped",
-			src:  "foo // trailing",
-			want: "foo\n",
 		},
 	}
 	for _, tt := range tests {
@@ -313,6 +322,28 @@ func TestBreakOperatorsIndent(t *testing.T) {
 	}
 }
 
+func TestBreakOperatorsInsideContainers(t *testing.T) {
+	for _, src := range []string{
+		"f(left_operand && right_operand)",
+		"[left_operand && right_operand]",
+		`{"key": left_operand && right_operand}`,
+		"f((left_operand && right_operand).foo)",
+		"[left_operand && right_operand].size()",
+		"{(left_operand && right_operand): 1}",
+	} {
+		t.Run(src, func(t *testing.T) {
+			got, err := FormatExpr(src, fmtConfigOf(fmtBreakOps()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			left, right := strings.Index(got, "left_operand"), strings.Index(got, "right_operand")
+			if left < 0 || right <= left || !strings.Contains(got[left:right], "\n") {
+				t.Errorf("break-operators should put the nested operands on different lines: %q", got)
+			}
+		})
+	}
+}
+
 func TestBreakOperatorsConditional(t *testing.T) {
 	got, err := FormatExpr("cond ? yes : no", fmtConfigOf(fmtBreakOps()))
 	if err != nil {
@@ -420,4 +451,308 @@ func TestFormatKeepsTrailingCommentBlocks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatDoesNotChangeExpression(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+	}{
+		{name: "optional list element", src: "[?optional.of(1)]"},
+		{name: "optional map entry", src: "{?a: 1}"},
+		{name: "optional select", src: "m.?field"},
+		{name: "triple-quoted string", src: `"""hello"""`},
+		{name: "comment containing delimiter", src: "f(a, // close ) note\nb)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := mustParseFormatFixture(t, tt.src)
+			out, err := FormatExpr(tt.src, nil)
+			if err == nil && !celast.EquivExpr(before, mustParseFormatFixture(t, out)) {
+				t.Errorf("formatting changed the expression: %q -> %q", tt.src, out)
+			}
+		})
+	}
+	// Optional index access is preserved by the formatter and must still format.
+	if got, err := FormatExpr(`m[?"k"]`, nil); err != nil {
+		t.Errorf("FormatExpr(m[?\"k\"]) = error %v, want success", err)
+	} else if got != `m[?"k"]` {
+		t.Errorf("FormatExpr(m[?\"k\"]) = %q, want %q", got, `m[?"k"]`)
+	}
+}
+
+func TestFormatPreservesComments(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		src      string
+		comments []string
+	}{
+		{
+			name:     "standalone and document trailing",
+			src:      "[\n  // keep me\n  1\n] // tail",
+			comments: []string{"// keep me", cmtTail},
+		},
+		{
+			name:     "between arguments",
+			src:      "f(a, // first argument\n  b)",
+			comments: []string{"// first argument"},
+		},
+		{
+			name:     "delimiter inside comment",
+			src:      "f(a, // close ) note\n  b)",
+			comments: []string{"// close ) note"},
+		},
+		{
+			name:     "after final container argument",
+			src:      "f([a] // final argument\n)",
+			comments: []string{"// final argument"},
+		},
+		{
+			name:     "before first call argument",
+			src:      "f(\n  // first argument\n  a,\n  b\n)",
+			comments: []string{"// first argument"},
+		},
+		{
+			name:     "after parenthesized root",
+			src:      "(a+b) // tail",
+			comments: []string{cmtTail},
+		},
+		{
+			name:     "nested list",
+			src:      "[[\n  // nested comment\n  1,\n]]",
+			comments: []string{"// nested comment"},
+		},
+		{
+			name:     "map with commented list value",
+			src:      "{\"x\": [1, // note\n  2]}",
+			comments: []string{cmtNote},
+		},
+		{
+			name:     "inside grouped call argument",
+			src:      "f((\n  // grouped argument\n  1\n), 2)",
+			comments: []string{"// grouped argument"},
+		},
+		{
+			name:     "empty standalone comment before first argument",
+			src:      "f(\n  //\n  1)",
+			comments: []string{cmtOnly},
+		},
+		{name: "boolean chain comment", src: "a &&\n  // important\n  b", comments: []string{cmtImportant}},
+		{name: "conditional branch comment", src: "a ?\n  // true branch\n  b : c", comments: []string{"// true branch"}},
+		{name: "inline binary operator comment", src: "a + // important\n  b", comments: []string{cmtImportant}},
+		{name: "binary comment in call argument", src: "f(a +\n  // note\n  b)", comments: []string{cmtNote}},
+		{name: "standalone comment after root", src: "a\n// trailing\n", comments: []string{"// trailing"}},
+		{name: "trailing comment after index", src: "a[0] // important", comments: []string{cmtImportant}},
+		{name: "comment after opening parenthesis", src: "( // title\na)", comments: []string{"// title"}},
+		{name: "comment in grouped map key", src: "{(\n// key\na): 1}", comments: []string{"// key"}},
+		{name: "comment in member call receiver", src: "[\n// receiver\n1,2].size()", comments: []string{"// receiver"}},
+		{name: "multiple trailer comments", src: "a // first\n// second\n", comments: []string{"// first", "// second"}},
+		{name: "trailing comment separated by blank line", src: "a\n\n// tail", comments: []string{cmtTail}},
+		{name: "map comment before colon", src: "{a // key\n : b}", comments: []string{"// key"}},
+		{name: "map comment after colon", src: "{a: // colon\n b}", comments: []string{"// colon"}},
+		{name: "inline conditional comment", src: "a ? // true branch\n b : c", comments: []string{"// true branch"}},
+		{name: "index operator comment", src: "a[ // index\n 0]", comments: []string{"// index"}},
+		{name: "unary operator comment", src: "! // unary\n a", comments: []string{"// unary"}},
+		{name: "group inside list and binary expression", src: "[a + ( // group\n b)]", comments: []string{"// group"}},
+		{name: "nested grouping comments", src: "(( // outer\n ( // inner\n a)))", comments: []string{"// outer", cmtInner}},
+		{name: "grouped operand comment in list", src: "[a + (b // group\n)]", comments: []string{"// group"}},
+		{name: "inner and outer trailing comments", src: "(a // inner\n) // outer", comments: []string{cmtInner, "// outer"}},
+		{name: "empty element comment", src: "[1, //\n 2]", comments: []string{cmtOnly}},
+		{name: "empty root comment", src: "a // ", comments: []string{cmtOnly}},
+		{name: "selector dot comment", src: "a.// dot\nb", comments: []string{"// dot"}},
+		{name: "trailer after grouped list item", src: "[(a) // note\n, 2]", comments: []string{cmtNote}},
+		{name: "trailer after grouped call argument", src: "f((a) // note\n, b)", comments: []string{cmtNote}},
+		{name: "trailer after grouped map value", src: "{'a': (b) // note\n, 'c': d}", comments: []string{cmtNote}},
+		{name: "slashes in string before grouping", src: "f('http://', (a + b) * c)"},
+		{name: "slashes in string before grouped comment", src: "['http://', ( // important\n a)]", comments: []string{cmtImportant}},
+		{name: "map comments before and after value", src: "{'a': // first\n 1 // second\n}", comments: []string{"// first", "// second"}},
+		{name: "comment before member method name", src: "a.// method\nsize()", comments: []string{"// method"}},
+		{name: "comment after index operand", src: "a[1 // inner\n]", comments: []string{cmtInner}},
+		{name: "comments in a selector chain", src: "a. // before\n b. // another\n c", comments: []string{"// before", "// another"}},
+		{name: "selector dot in a preceding comment", src: "a // .\n .b // tail", comments: []string{"// .", cmtTail}},
+		{name: "trailer after nested root grouping", src: "((a) // middle\n) // tail\n// final", comments: []string{"// middle", cmtTail, "// final"}},
+		{name: "comment between callee and opening paren", src: "foo // callee\n (a,b)", comments: []string{"// callee"}},
+		{name: "comment between receiver and opening bracket", src: "a // receiver\n [b]", comments: []string{"// receiver"}},
+		{name: "comment in call receiver should be kept once", src: "foo( // inner call\n ).bar(x)", comments: []string{"// inner call"}},
+		{
+			name:     "multiple leading comment blocks",
+			src:      "// first block\n\n// second block\nx",
+			comments: []string{"// first block", "// second block"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := mustParseFormatFixture(t, tc.src)
+			out, err := Format(tc.src, nil)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+			if !celast.EquivExpr(before, mustParseFormatFixture(t, out)) {
+				t.Errorf("formatting changed the expression: %q -> %q", tc.src, out)
+			}
+			for _, comment := range tc.comments {
+				if got, want := strings.Count(out, comment), strings.Count(tc.src, comment); got != want {
+					t.Errorf("formatted output %q has %d copies of %q, want %d", out, got, comment, want)
+				}
+			}
+			again, err := Format(out, nil)
+			if err != nil {
+				t.Fatalf("second Format: %v", err)
+			}
+			if again != out {
+				t.Errorf("formatting again changed output: %q -> %q", out, again)
+			}
+		})
+	}
+}
+
+func TestFormatKeepsCommentsOnTheirSideOfGroupedExpression(t *testing.T) {
+	const src = "(\n  // before\n  policy_value\n  // after\n)"
+	out, err := Format(src, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, expr, after := strings.Index(out, "// before"), strings.Index(out, "policy_value"), strings.Index(out, "// after")
+	if before < 0 || expr <= before || after <= expr {
+		t.Errorf("formatted output %q should keep the two comments on opposite sides of the expression", out)
+	}
+}
+
+func TestFormatKeepsCommentBetweenGroupedOperands(t *testing.T) {
+	const src = "(left_value +\n  // describes right operand\n  right_value)"
+	out, err := Format(src, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, comment, right := strings.Index(out, "left_value"), strings.Index(out, "// describes right operand"), strings.Index(out, "right_value")
+	if left < 0 || comment <= left || right <= comment {
+		t.Errorf("formatted output %q should keep the comment between the operands", out)
+	}
+}
+
+func TestFormatOperatorBreaksPreserveGrouping(t *testing.T) {
+	const src = `has(a.b) && (a.b || c)`
+	out, err := FormatExpr(src, fmtConfigOf(fmtBreakOps()))
+	if err != nil {
+		t.Fatalf("FormatExpr: %v", err)
+	}
+	if !strings.Contains(out, "\n") {
+		t.Errorf("output %q does not break operators", out)
+	}
+	if !celast.EquivExpr(mustParseFormatFixture(t, src), mustParseFormatFixture(t, out)) {
+		t.Errorf("formatting changed the expression: %q -> %q", src, out)
+	}
+}
+
+func TestFormatIdempotenceForReceiverCallsAndNarrowGuards(t *testing.T) {
+	for _, tc := range []struct {
+		src string
+		cfg Config
+	}{
+		{src: "foo().bar(x)"},
+		{src: "has(a.b) && a.b.field == 123456789", cfg: fmtConfigOf(fmtWidth(30))},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			first, err := FormatExpr(tc.src, tc.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := FormatExpr(first, tc.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second != first {
+				t.Errorf("second format changed %q to %q", first, second)
+			}
+		})
+	}
+}
+
+type identRewriteRule struct{ synthetic bool }
+
+func (identRewriteRule) Meta() FormatMeta { return FormatMeta{Name: "rewrite-ident"} }
+
+func (r identRewriteRule) Rewrite(a *celast.AST) (*celast.AST, error) {
+	id := a.Expr().ID()
+	if r.synthetic {
+		id += 1000
+	}
+	expr := celast.NewExprFactory().NewIdent(id, "renamed")
+	return celast.NewAST(expr, a.SourceInfo()), nil
+}
+
+func TestFormatUsesRewrittenIdentifierWithOrWithoutSourceSpan(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		synthetic bool
+	}{{name: "existing ID"}, {name: "synthetic ID", synthetic: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Errorf("valid identifier rewrite panicked: %v", p)
+				}
+			}()
+			got, err := FormatExpr("original", fmtConfigOf(identRewriteRule{synthetic: tc.synthetic}))
+			if err != nil || got != "renamed" {
+				t.Errorf("identifier rewrite = %q, %v; want renamed", got, err)
+			}
+		})
+	}
+}
+
+type numericRewriteRule struct{ value celref.Val }
+
+func (numericRewriteRule) Meta() FormatMeta { return FormatMeta{Name: "rewrite-number"} }
+
+func (r numericRewriteRule) Rewrite(a *celast.AST) (*celast.AST, error) {
+	expr := celast.NewExprFactory().NewLiteral(a.Expr().ID(), r.value)
+	return celast.NewAST(expr, a.SourceInfo()), nil
+}
+
+func TestNumericRewritesKeepCELType(t *testing.T) {
+	for _, tc := range []struct {
+		want  string
+		value celref.Val
+	}{
+		{want: "1.0", value: types.Double(1)},
+		{want: "2.0", value: types.Double(2)},
+		{want: "1u", value: types.Uint(1)},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			got, err := FormatExpr("1", fmtConfigOf(numericRewriteRule{value: tc.value}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !celast.EquivExpr(mustParseFormatFixture(t, got), mustParseFormatFixture(t, tc.want)) {
+				t.Errorf("rewritten CEL %q has a different value or type from %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatEmitsRewrittenLiteral(t *testing.T) {
+	out, err := FormatExpr("false", fmtConfigOf(replaceWithTrueRule{}))
+	if err != nil {
+		t.Fatalf("FormatExpr with rewrite: %v", err)
+	}
+	if out != "true" {
+		t.Errorf("FormatExpr with rewrite = %q, want true", out)
+	}
+}
+
+type replaceWithTrueRule struct{}
+
+func (replaceWithTrueRule) Meta() FormatMeta { return FormatMeta{Name: "replace-with-true"} }
+
+func (replaceWithTrueRule) Rewrite(a *celast.AST) (*celast.AST, error) {
+	expr := celast.NewExprFactory().NewLiteral(a.Expr().ID(), types.True)
+	return celast.NewAST(expr, a.SourceInfo()), nil
+}
+
+func mustParseFormatFixture(t *testing.T, src string) celast.Expr {
+	t.Helper()
+	a, err := celtsource.Parse(common.NewStringSource(src, t.Name()))
+	if err != nil {
+		t.Fatalf("cannot parse %q: %v", src, err)
+	}
+	return a.Expr()
 }

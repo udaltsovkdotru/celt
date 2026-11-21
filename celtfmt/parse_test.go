@@ -42,7 +42,7 @@ func TestLeadingDoc(t *testing.T) {
 		{name: "indented comment trimmed", src: "   // header\nexpr", want: []string{"// header"}},
 		{name: "multiple contiguous", src: "// a\n// b\n\nbar", want: []string{"// a", "// b"}},
 		{name: "blank after doc stops", src: "// a\n\n\nbar", want: []string{"// a"}},
-		{name: "blank then comment stops", src: "//a\n\n// b\nexpr", want: []string{"//a"}},
+		{name: "blank-separated blocks preserved", src: "//a\n\n// b\nexpr", want: []string{"//a", "", "// b"}},
 		{name: "no comment", src: "expr", want: nil},
 		{name: "empty input", src: "", want: nil},
 		{name: "blank lines only", src: "\n\n", want: nil},
@@ -157,9 +157,10 @@ func TestTrailingComment(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &celConverter{src: tt.src}
-			if got := b.trailingComment(tt.after, tt.limit); got != tt.want {
-				t.Errorf("trailingComment(%q, %d, %d) = %q, want %q",
-					tt.src, tt.after, tt.limit, got, tt.want)
+			got, present := b.trailingComment(tt.after, tt.limit)
+			if got != tt.want || present != (tt.want != "") {
+				t.Errorf("trailingComment(%q, %d, %d) = (%q, %v), want (%q, %v)",
+					tt.src, tt.after, tt.limit, got, present, tt.want, tt.want != "")
 			}
 		})
 	}

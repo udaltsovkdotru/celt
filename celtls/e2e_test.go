@@ -115,9 +115,10 @@ func (e2eQuickFix) Apply(ctx ActionContext) []protocol.CodeAction {
 			continue
 		}
 		out = append(out, protocol.CodeAction{
-			Title:       celtlint.UseInstead(f.HintCallee()),
-			Kind:        protocol.QuickFix,
-			IsPreferred: true,
+			Title: celtlint.UseInstead(f.HintCallee()),
+			Kind:  protocol.QuickFix,
+			// Mirrors the production quick-fix action (celtls/actions): no
+			// IsPreferred, so the copy cannot diverge from the real behavior.
 			Edit: &protocol.WorkspaceEdit{
 				Changes: map[protocol.DocumentURI][]protocol.TextEdit{
 					ctx.URI: {{Range: fRange, NewText: f.FixText()}},
@@ -185,6 +186,24 @@ func e2eNewServer(t *testing.T) (*Server, *e2eConn) {
 		e2eQuickFix{ActionMeta: ActionMeta{Name: "quick-fix", Desc: "apply finding fixes"}},
 		e2eFormat{ActionMeta: ActionMeta{Name: "format", Desc: "format the document"}, cfg: e2eEmptyCfg{}},
 	))
+	// These scenarios drive the handler dispatch path directly and assume a
+	// working session with a fully capable client (the initialize handshake
+	// normally establishes both).
+	s.initialized = true
+	s.caps = protocol.ClientCapabilities{
+		TextDocument: &protocol.TextDocumentClientCapabilities{
+			CodeAction: &protocol.CodeActionClientCapabilities{
+				CodeActionLiteralSupport: &protocol.CodeActionClientCapabilitiesLiteralSupport{
+					CodeActionKind: &protocol.CodeActionClientCapabilitiesKind{},
+				},
+			},
+			Completion: &protocol.CompletionTextDocumentClientCapabilities{
+				CompletionItem: &protocol.CompletionTextDocumentClientCapabilitiesItem{
+					SnippetSupport: true,
+				},
+			},
+		},
+	}
 	conn := &e2eConn{out: &bytes.Buffer{}}
 	s.conn = jsonrpc2.NewConn(jsonrpc2.NewStream(conn))
 	return s, conn
@@ -287,10 +306,47 @@ func e2ePublishedNonEmpty(t *testing.T, c *e2eConn, docURI protocol.DocumentURI)
 	return false
 }
 
+type e2eSpanOnlyAnalyzer struct{ Analyzer }
+
+func (e2eSpanOnlyAnalyzer) Analyze(_, _ string) []celtlint.Finding {
+	return []celtlint.Finding{{
+		Code: celtlint.CodeOddComparison, Message: "odd comparison",
+		End:   celtlint.Position{Char: 1},
+		Spans: []celtlint.Span{{Start: celtlint.Position{Char: 5}, End: celtlint.Position{Char: 6}}},
+	}}
+}
+
+func TestE2EDoesNotPublishEmptySecondaryDiagnostic(t *testing.T) {
+	s, conn := e2eNewServer(t)
+	s.analyzer = e2eSpanOnlyAnalyzer{}
+	e2eOpen(t, s, e2eLifecycleURI, "a == b")
+	var found bool
+	for _, n := range e2eDecodeNotifs(t, conn) {
+		if n.Method() != e2eMethodPublish {
+			continue
+		}
+		var p protocol.PublishDiagnosticsParams
+		if err := json.Unmarshal(n.Params(), &p); err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range p.Diagnostics {
+			if d.Message == "" {
+				t.Errorf("published an empty diagnostic for secondary span %v", d.Range)
+			}
+			found = found || d.Message == "odd comparison"
+		}
+	}
+	if !found {
+		t.Error("expected the primary comparison diagnostic")
+	}
+}
+
 // TestE2EInitialize asserts the initialize handshake advertises the server
-// capabilities.
+// capabilities. The shared harness pre-initializes the server to drive other
+// scenarios, so this test resets it to exercise a genuine first initialize.
 func TestE2EInitialize(t *testing.T) {
 	s, _ := e2eNewServer(t)
+	s.initialized = false
 
 	initRes := e2eDispatch(t, s, e2eMethodInitialize, protocol.InitializeParams{})
 	init, ok := initRes.result.(*protocol.InitializeResult)

@@ -1,7 +1,6 @@
 package celtsource
 
 import (
-	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -11,6 +10,26 @@ type Position struct {
 	Char int
 }
 
+// nextLineBreak returns the byte index of the first line-break sequence at or
+// after i, and the index just past it. A line break is \n, \r, or \r\n, so CR-
+// only files (and LSP line arithmetic) split lines the same way LF files do.
+func nextLineBreak(content string, i int) (idx, after int) {
+	for i < len(content) {
+		switch content[i] {
+		case '\r':
+			after = i + 1
+			if after < len(content) && content[after] == '\n' {
+				after++
+			}
+			return i, after
+		case '\n':
+			return i, i + 1
+		}
+		i++
+	}
+	return -1, -1
+}
+
 func OffsetToPos(content string, off int) Position {
 	if off < 0 {
 		off = 0
@@ -18,19 +37,34 @@ func OffsetToPos(content string, off int) Position {
 	if off > len(content) {
 		off = len(content)
 	}
-	line := strings.Count(content[:off], "\n")
-	lineStart := strings.LastIndex(content[:off], "\n") + 1
-	return Position{Line: line, Char: off - lineStart}
+	line := 0
+	lastLineStart := 0
+	i := 0
+	for i < off {
+		idx, after := nextLineBreak(content, i)
+		if idx < 0 || off <= idx {
+			break
+		}
+		// An offset inside a multi-byte break (e.g. between the CR and LF of
+		// CRLF) belongs to the line being terminated, not to the next line.
+		if off < after {
+			break
+		}
+		line++
+		lastLineStart = after
+		i = after
+	}
+	return Position{Line: line, Char: off - lastLineStart}
 }
 
 func PosToOffset(content string, p Position) int {
 	off := 0
 	for i := 0; i < p.Line && off < len(content); i++ {
-		nl := strings.IndexByte(content[off:], '\n')
-		if nl < 0 {
+		_, after := nextLineBreak(content, off)
+		if after < 0 {
 			break
 		}
-		off += nl + 1
+		off = after
 	}
 	return off + p.Char
 }
@@ -77,18 +111,18 @@ func UTF16ToByteCol(line string, char int) int {
 
 func LineByteRange(content string, line int) (start, end int) {
 	for l := 0; l < line && start < len(content); l++ {
-		nl := strings.IndexByte(content[start:], '\n')
-		if nl < 0 {
+		_, after := nextLineBreak(content, start)
+		if after < 0 {
 			start = len(content)
 			break
 		}
-		start += nl + 1
+		start = after
 	}
-	end = strings.IndexByte(content[start:], '\n')
-	if end < 0 {
+	idx, _ := nextLineBreak(content, start)
+	if idx < 0 {
 		end = len(content)
 	} else {
-		end += start
+		end = idx
 	}
 	return start, end
 }

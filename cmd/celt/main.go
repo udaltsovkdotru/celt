@@ -1,10 +1,14 @@
-// Command celt is a generic CEL linter/formatter built on the celt framework.
-// It is not tied to any particular message vocabulary: the environment is
-// built from the standard CEL extension libraries, optionally backed by a
-// protobuf FileDescriptorSet (--descriptor) to resolve message fields and
-// enums. Rules and actions are configured in .celt.yml (fmt/lint sections).
-// Any CEL that type-checks against that environment can be linted, formatted
-// and served over LSP via the lint, format and lsp subcommands.
+// Command celt is a generic CEL linter, formatter and language server built on
+// the celt framework. It is not tied to any particular message vocabulary: the
+// environment is declared in .celt.yml (the env section — variables, functions,
+// macros and types, plus optional CEL extensions such as strings or optional),
+// and optionally backed by a protobuf FileDescriptorSet (--descriptor) to
+// resolve message fields and enums. Rules are configured in .celt.yml (fmt/lint
+// sections); code actions are wired in by the CLI rather than configured there.
+// CEL that type-checks against that environment can be linted via the lint
+// subcommand; the format subcommand handles the constructs the formatter
+// supports, and rejects a few it cannot yet preserve (e.g. optional syntax and
+// comprehensions) rather than rewriting them.
 package main
 
 import (
@@ -51,11 +55,12 @@ func main() {
 	}
 }
 
-// buildAnalyzer loads the config, descriptor set and CEL env, and constructs
+// buildAnalyzer loads the config (searched from configDir, or the process
+// working directory when empty), descriptor set and CEL env, and constructs
 // the lint analyzer shared by the lint and lsp subcommands. The loaded config
 // is returned for consumers that need it (e.g. the LSP format config).
-func buildAnalyzer(descriptor *string) (*celtlint.Analyzer, *config, error) {
-	cfg, err := loadConfig()
+func buildAnalyzer(descriptor *string, configDir string) (*celtlint.Analyzer, *config, error) {
+	cfg, err := loadConfig(configDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -71,7 +76,7 @@ func buildAnalyzer(descriptor *string) (*celtlint.Analyzer, *config, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	opts := []celtlint.Option{celtlint.WithConfigProvider(cfg), celtlint.WithRules(lintrules.All()...)}
+	opts := []celtlint.Option{celtlint.WithConfigProvider(cfg), celtlint.WithRules(lintrules.All()...), celtlint.WithFormatConfig(cfg)}
 	if fdset != nil {
 		opts = append(opts, celtlint.WithDescriptor(fdset))
 	}
@@ -82,8 +87,15 @@ func buildAnalyzer(descriptor *string) (*celtlint.Analyzer, *config, error) {
 	return analyzer, cfg, nil
 }
 
-//nolint:gocyclo,funlen // top-level CLI flow: setup, per-file loop, and fix/report branches
-func runLint(args []string) int {
+// lintArgs holds the parsed `celt lint` flags.
+type lintArgs struct {
+	dir, descriptor string
+	fix             bool
+}
+
+// parseLintFlags parses the `celt lint` flags. It returns a nil args with a
+// non-zero exit code when parsing fails or a required flag is missing.
+func parseLintFlags(args []string) (la *lintArgs, code int) {
 	fs := flag.NewFlagSet("lint", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	dir := fs.String("dir", "", "directory containing .cel files")
@@ -91,31 +103,32 @@ func runLint(args []string) int {
 	fix := fs.Bool("fix", false, "apply suggested fixes in place")
 	fs.Usage = func() { subUsage(fs, "usage: celt lint [flags]", "Lint .cel files in a directory.") }
 	if err := fs.Parse(args); err != nil {
-		return helpExit(err)
+		return nil, helpExit(err)
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "celt lint: unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		return nil, 2
 	}
 	if *dir == "" {
 		fmt.Fprintln(os.Stderr, "celt lint: --dir is required")
 		fs.Usage()
-		return 2
+		return nil, 2
 	}
+	return &lintArgs{dir: *dir, descriptor: *descriptor, fix: *fix}, 0
+}
 
-	analyzer, _, err := buildAnalyzer(descriptor)
-	if err != nil {
-		return fatalf("lint", err)
-	}
-
-	files, err := celFiles(*dir)
-	if err != nil {
-		return fatalf("lint", err)
-	}
-
-	results := make([]celtlint.LintedSource, 0, len(files))
-	hadError := false
+// analyzeFiles reads and analyzes each file, returning the linted sources, a
+// flag that an error-severity finding was seen, and a non-zero exit code if a
+// file could not be read.
+func analyzeFiles(analyzer *celtlint.Analyzer, files []string) (results []celtlint.LintedSource, hadError bool, code int) {
+	results = make([]celtlint.LintedSource, 0, len(files))
+	hadError = false
 	for _, f := range files {
 		content, rerr := os.ReadFile(f)
 		if rerr != nil {
 			fmt.Fprintf(os.Stderr, "celt lint: %s: %v\n", f, rerr)
-			return 1
+			return nil, false, 1
 		}
 		findings := analyzer.Analyze(f, string(content))
 		for i := range findings {
@@ -125,41 +138,54 @@ func runLint(args []string) int {
 		}
 		results = append(results, celtlint.LintedSource{Name: f, Content: string(content), Findings: findings})
 	}
+	return results, hadError, 0
+}
 
-	if *fix {
-		fixed := 0
-		for i := range results {
-			newSrc, _, applied := celtlint.ApplyFixes(results[i].Content, results[i].Findings)
-			if !applied {
-				continue
-			}
-			if err := celtfmt.WriteFile(results[i].Name, []byte(newSrc)); err != nil {
-				fmt.Fprintf(os.Stderr, "celt lint: fix %s: %v\n", results[i].Name, err)
-				return 1
-			}
-			results[i].Content = newSrc
-			fixed++
+// fixLintResults applies each file's suggested fixes, rejecting edits that
+// introduce a new compile error. It returns the number of files fixed and a
+// non-zero exit code if writing a fixed file fails.
+func fixLintResults(analyzer *celtlint.Analyzer, results []celtlint.LintedSource) (fixed, code int) {
+	fixed = 0
+	for i := range results {
+		newSrc, _, applied := celtlint.ApplyFixes(results[i].Content, results[i].Findings)
+		if !applied {
+			continue
 		}
-		// Re-analyze the (possibly fixed) sources so unfixable findings still
-		// affect the exit code, and render what remains after fixing.
-		hadError = false
-		for i := range results {
-			results[i].Findings = analyzer.Analyze(results[i].Name, results[i].Content)
-			for j := range results[i].Findings {
-				if results[i].Findings[j].IsError() {
-					hadError = true
-				}
-			}
+		// A candidate fix must not make a file more invalid. The compiler
+		// is consulted directly (independently of whether the compile rule
+		// is enabled), so an edit that introduces a NEW compile error is
+		// rejected even when the original already has one (e.g. an
+		// unrelated `&& bogus`) or when compile findings are disabled.
+		if introducesNewCompileError(analyzer.CompileErrors(newSrc), analyzer.CompileErrors(results[i].Content)) {
+			continue
 		}
-		fmt.Fprint(os.Stderr, celtlint.RenderAll(results))
-		fmt.Fprintf(os.Stderr, "fixed %d file(s)\n", fixed)
-		if hadError {
-			return 1
+		if err := celtfmt.WriteFile(results[i].Name, []byte(newSrc)); err != nil {
+			fmt.Fprintf(os.Stderr, "celt lint: fix %s: %v\n", results[i].Name, err)
+			return fixed, 1
 		}
-		return 0
+		results[i].Content = newSrc
+		fixed++
 	}
+	return fixed, 0
+}
 
-	fmt.Fprint(os.Stderr, celtlint.RenderAll(results))
+// reanalyze re-lints the (possibly fixed) in-memory sources, updating their
+// findings in place, and reports whether any error-severity finding remains.
+func reanalyze(analyzer *celtlint.Analyzer, results []celtlint.LintedSource) bool {
+	hadError := false
+	for i := range results {
+		results[i].Findings = analyzer.Analyze(results[i].Name, results[i].Content)
+		for j := range results[i].Findings {
+			if results[i].Findings[j].IsError() {
+				hadError = true
+			}
+		}
+	}
+	return hadError
+}
+
+// renderSummary prints the aggregate check/error/warning/fixable stats.
+func renderSummary(results []celtlint.LintedSource, prog string) {
 	var stats celtlint.Stats
 	stats.Checked = len(results)
 	for _, r := range results {
@@ -174,11 +200,47 @@ func runLint(args []string) int {
 			}
 		}
 	}
-	fmt.Fprintln(os.Stderr, celtlint.Summary(stats, filepath.Base(os.Args[0])))
+	fmt.Fprintln(os.Stderr, celtlint.Summary(stats, prog))
+}
+
+// boolToExit maps an error-severity-present flag to the process exit code.
+func boolToExit(hadError bool) int {
 	if hadError {
 		return 1
 	}
 	return 0
+}
+
+func runLint(args []string) int {
+	la, code := parseLintFlags(args)
+	if la == nil {
+		return code
+	}
+	analyzer, _, err := buildAnalyzer(&la.descriptor, la.dir)
+	if err != nil {
+		return fatalf("lint", err)
+	}
+	files, err := celFiles(la.dir)
+	if err != nil {
+		return fatalf("lint", err)
+	}
+	results, hadError, code := analyzeFiles(analyzer, files)
+	if code != 0 {
+		return code
+	}
+	if la.fix {
+		fixed, code := fixLintResults(analyzer, results)
+		if code != 0 {
+			return code
+		}
+		hadError = reanalyze(analyzer, results)
+		fmt.Fprint(os.Stderr, celtlint.RenderAll(results))
+		fmt.Fprintf(os.Stderr, "fixed %d file(s)\n", fixed)
+		return boolToExit(hadError)
+	}
+	fmt.Fprint(os.Stderr, celtlint.RenderAll(results))
+	renderSummary(results, filepath.Base(os.Args[0]))
+	return boolToExit(hadError)
 }
 
 func runLSP(args []string) int {
@@ -190,13 +252,24 @@ func runLSP(args []string) int {
 		return helpExit(err)
 	}
 
-	analyzer, cfg, err := buildAnalyzer(descriptor)
+	analyzer, cfg, err := buildAnalyzer(descriptor, "")
 	if err != nil {
 		return fatalf("lsp", err)
+	}
+	// Rebuild the analyzer for the workspace chosen at initialize time, so a
+	// server launched outside the project still uses the workspace's .celt.yml
+	// (variables/descriptors/rules) rather than only the launcher's config.
+	builder := func(dir string) (lsp.Analyzer, celtfmt.Config, []lsp.Action, error) {
+		a, c, err := buildAnalyzer(descriptor, dir)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return a, c, actions.All(c), nil
 	}
 	if err := lsp.New(analyzer,
 		lsp.WithFormatConfig(cfg),
 		lsp.WithActions(actions.All(cfg)...),
+		lsp.WithAnalyzerBuilder(builder),
 		lsp.WithName("celt"),
 	).Run(); err != nil {
 		return fatalf("lsp", err)
@@ -248,6 +321,30 @@ func helpExit(err error) int {
 		return 0
 	}
 	return 2
+}
+
+// introducesNewCompileError reports whether newErrs introduces a compiler error
+// that was not already present at the same frequency in oldErrs. An error whose
+// message never appeared before is new, as is an error that appears more often
+// than it did before (e.g. a second incompatible ternary). When the counts all
+// match, the fix neither adds nor removes an error, so it is allowed. Comparing
+// occurrences rather than distinct messages keeps a candidate from slipping
+// through when the original file already contained the same kind of error.
+func introducesNewCompileError(newErrs, oldErrs []string) bool {
+	oldCount := make(map[string]int, len(oldErrs))
+	for _, e := range oldErrs {
+		oldCount[e]++
+	}
+	newCount := make(map[string]int, len(newErrs))
+	for _, e := range newErrs {
+		newCount[e]++
+	}
+	for msg, n := range newCount {
+		if n > oldCount[msg] {
+			return true
+		}
+	}
+	return false
 }
 
 func fatalf(cmd string, err error) int {

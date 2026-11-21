@@ -11,6 +11,7 @@ import (
 )
 
 const rlPersonTypeName = "test.Person"
+const rlNickname = "nickname"
 
 // Rule names exercised by the tests, shared between the All() list check and
 // the per-rule constructors to avoid divergent literals.
@@ -70,7 +71,7 @@ func rlDescriptorSet() *descriptorpb.FileDescriptorSet {
 								TypeName: proto.String(".test.Role"),
 							},
 							{
-								Name:           proto.String("nickname"),
+								Name:           proto.String(rlNickname),
 								Number:         proto.Int32(3),
 								Label:          descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
 								Type:           descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
@@ -99,7 +100,7 @@ func rlEnv(t *testing.T) *cel.Env {
 		cel.TypeDescs(rlDescriptorSet()),
 		cel.Variable("p", cel.ObjectType(rlPersonTypeName)),
 		cel.Variable("q", cel.ObjectType(rlPersonTypeName)),
-		cel.Variable("nickname", cel.StringType),
+		cel.Variable(rlNickname, cel.StringType),
 	)
 	if err != nil {
 		t.Fatalf("NewEnv: %v", err)
@@ -211,8 +212,8 @@ func TestMisspellRuleSuggestsCorrection(t *testing.T) {
 	if f.Message != sgUnknownIdent {
 		t.Errorf("Message = %q, want %q", f.Message, sgUnknownIdent)
 	}
-	if f.Fix != "nickname" {
-		t.Errorf("Fix = %q, want %q", f.Fix, "nickname")
+	if f.Fix != rlNickname {
+		t.Errorf("Fix = %q, want %q", f.Fix, rlNickname)
 	}
 	if f.Level != celtlint.LevelError {
 		t.Errorf("Level = %v, want error", f.Level)
@@ -242,8 +243,8 @@ func TestRawEnumValueRuleFlagsNumericLiteral(t *testing.T) {
 	if f.Message != "use of a raw enum value" {
 		t.Errorf("Message = %q, want %q", f.Message, "use of a raw enum value")
 	}
-	if f.Fix != "Status.ACTIVE" {
-		t.Errorf("Fix = %q, want %q", f.Fix, "Status.ACTIVE")
+	if f.Fix != "test.Status.ACTIVE" {
+		t.Errorf("Fix = %q, want %q", f.Fix, "test.Status.ACTIVE")
 	}
 	if f.Level != celtlint.LevelWarn {
 		t.Errorf("Level = %v, want warn", f.Level)

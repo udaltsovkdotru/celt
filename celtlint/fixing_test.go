@@ -109,6 +109,17 @@ func TestApplyFixesInvalidRangeKept(t *testing.T) {
 	}
 }
 
+func TestApplyFixesDoesNotCrossLinesFromInvalidColumn(t *testing.T) {
+	const src = "ab\ncd"
+	f := opFixFinding("X", Position{Line: 0, Char: 4}, Position{Line: 0, Char: 5})
+	got, kept, changed := ApplyFixes(src, []Finding{f})
+	rejected := got == src && !changed && len(kept) == 1
+	clampedToLine := got == "abX\ncd" && changed && len(kept) == 0
+	if !rejected && !clampedToLine {
+		t.Errorf("out-of-line fix must not edit the next line: source=%q changed=%v kept=%+v", got, changed, kept)
+	}
+}
+
 // TestApplyFixesClampAtEnd asserts a fix range positioned at the end of the
 // source appends text (offsets are clamped to the source length).
 func TestApplyFixesClampAtEnd(t *testing.T) {

@@ -1,4 +1,4 @@
-//nolint:goconst,misspell // table-driven tests intentionally repeat identifiers and use misspelled tokens to exercise the detector.
+//nolint:misspell // tests intentionally use misspelled tokens to exercise the detector
 package rules
 
 import (
@@ -6,12 +6,19 @@ import (
 	"testing"
 
 	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/ext"
 	"google.golang.org/protobuf/proto"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/udaltsovkdotru/celt/celtindex"
 	"github.com/udaltsovkdotru/celt/celtlint"
 	"github.com/udaltsovkdotru/celt/celtsource"
+)
+
+// Misspelled tokens and macro names repeated across the table-driven tests.
+const (
+	msUserNme = "userNme"
+	msHsa     = "hsa"
 )
 
 // msEnv builds a small env with one variable, one object-typed variable and
@@ -135,7 +142,7 @@ func TestMsCheckMisspellSuggestions(t *testing.T) {
 		message string
 		fix     string
 	}{
-		{"identifier", "userNme", celtlint.CodeUnknownIdentifier, "unknown identifier", "userName"},
+		{"identifier", msUserNme, celtlint.CodeUnknownIdentifier, "unknown identifier", "userName"},
 		{"function", `processDaa("x")`, celtlint.CodeUnknownIdentifier, "unknown identifier", "processData"},
 		{"enum value", "Color.REEN", celtlint.CodeUnknownEnumVariant, "unknown enum variant", "GREEN"},
 		{"object field", "w.nmae", celtlint.CodeUnknownField, "unknown field", "name"},
@@ -195,6 +202,102 @@ func TestMsCheckMisspellSkipsStringsAndComments(t *testing.T) {
 	}
 }
 
+// TestMsCheckMisspellSkipsComprehensionVars verifies comprehension-bound locals
+// (the iteration variable of .all/.map/.filter/...) are not offered for rename,
+// even when a close global name exists.
+func TestMsCheckMisspellSkipsComprehensionVars(t *testing.T) {
+	env := msEnv(t)
+	a := msNewAnalyzer(t, env)
+	for _, content := range []string{
+		`[1].all(userNme, userNme > 0)`,
+		`[1].map(userNme, userNme)`,
+	} {
+		if fs := a.Analyze("x.cel", content); len(fs) != 0 {
+			t.Errorf("Analyze(%q) = %d findings, want 0 (comprehension-bound local): %+v", content, len(fs), fs)
+		}
+	}
+}
+
+// TestMsCheckMisspellSkipsNamespaceQualifiers verifies that a bare identifier
+// starting a dotted member access is treated as a namespace/type/package
+// qualifier, not a free identifier to rename: the `cel` in `cel.bind(...)`
+// (ext.Bindings) and a qualified type prefix.
+func TestMsCheckMisspellSkipsNamespaceQualifiers(t *testing.T) {
+	env, err := cel.NewEnv(ext.Bindings(), cel.Variable("x", cel.StringType))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := msNewAnalyzer(t, env)
+	for _, content := range []string{
+		`cel.bind(y, "b", y == "b")`,
+		`cel.bind(y, "b", y == "b") && true`,
+	} {
+		if _, issues := env.Compile(content); issues.Err() != nil {
+			t.Fatalf("fixture %q invalid: %v", content, issues.Err())
+		}
+		for _, f := range a.Analyze("x.cel", content) {
+			t.Errorf("Analyze(%q) produced %s (%q) on namespace qualifier", content, f.Code, f.Message)
+		}
+	}
+}
+
+// TestMsCheckMisspellSkipsQualifiedProtoPrefix verifies that a fully-qualified
+// proto type reference (`pkg.Type.field`) does not flag the package/type
+// segments (`pkg`, `Type`) as unknown identifiers: they are namespace
+// qualifiers resolved through the type system.
+func TestMsCheckMisspellSkipsQualifiedProtoPrefix(t *testing.T) {
+	fdset := &descriptorpb.FileDescriptorSet{File: []*descriptorpb.FileDescriptorProto{{
+		Name: proto.String("com.example.proto"), Package: proto.String("com.example"), Syntax: proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Widget"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name: proto.String("name"), Number: proto.Int32(1),
+				Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(), Type: descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+			}},
+		}},
+	}}}
+	env, err := cel.NewEnv(cel.TypeDescs(fdset), cel.Variable("w", cel.ObjectType("com.example.Widget")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := celtlint.New(env,
+		celtlint.WithDescriptor(fdset),
+		celtlint.WithRules(Misspell{RuleMeta: celtlint.RuleMeta{
+			Name: "misspell", Defaults: celtlint.RuleParams{Level: celtlint.LevelError},
+		}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := `com.example.Widget{name: "x"}.name == "x"`
+	if _, issues := env.Compile(content); issues.Err() != nil {
+		t.Fatalf("fixture invalid: %v", issues.Err())
+	}
+	if fs := a.Analyze("x.cel", content); len(fs) != 0 {
+		t.Fatalf("qualified proto reference produced findings: %+v", fs)
+	}
+}
+
+// TestMsCheckMisspellFlagsReceiverVariableTypo verifies that a namespace is
+// only treated as such when it is actually a known qualifier: a near-miss of a
+// declared variable used as a receiver (`reul.field` for `rule.field`) is
+// still reported, because the namespace index does not swallow genuine typos.
+func TestMsCheckMisspellFlagsReceiverVariableTypo(t *testing.T) {
+	env, err := cel.NewEnv(cel.Variable("rule", cel.ObjectType("com.example.Widget")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := msNewAnalyzer(t, env)
+	fs := a.Analyze("x.cel", `reul.name == "x"`)
+	f, ok := rlFindByCode(fs, celtlint.CodeUnknownIdentifier)
+	if !ok {
+		t.Fatalf("receiver typo of a variable was not reported: %+v", fs)
+	}
+	if f.Fix != "rule" {
+		t.Errorf("Fix = %q, want %q", f.Fix, "rule")
+	}
+}
+
 // TestMsIsCheckMacroError verifies the macro-call matcher used by the compile
 // error dedup: a detail mentioning a macro name immediately followed by '('.
 func TestMsIsCheckMacroError(t *testing.T) {
@@ -204,10 +307,10 @@ func TestMsIsCheckMacroError(t *testing.T) {
 		macros []string
 		want   bool
 	}{
-		{"macro call present", "use has(x) instead", []string{"has", "exists"}, true},
-		{"other macro in list", "call exists(x)", []string{"has", "exists"}, true},
-		{"name contains macro but no call parens", "undeclared `hasmap`", []string{"has"}, false},
-		{"no macro mention", "undeclared `foo`", []string{"has"}, false},
+		{"macro call present", "use has(x) instead", []string{lnHasMacro, "exists"}, true},
+		{"other macro in list", "call exists(x)", []string{lnHasMacro, "exists"}, true},
+		{"name contains macro but no call parens", "undeclared `hasmap`", []string{lnHasMacro}, false},
+		{"no macro mention", "undeclared `foo`", []string{lnHasMacro}, false},
 		{"no macros configured", "call has(x)", nil, false},
 	}
 	for _, tc := range cases {
@@ -228,12 +331,12 @@ func TestMsReportedMacroTypo(t *testing.T) {
 		macros   []string
 		want     bool
 	}{
-		{"near-miss typo", map[string]bool{"hsa": true}, []string{"has"}, true},
-		{"exact macro name", map[string]bool{"has": true}, []string{"has"}, true},
-		{"case-insensitive typo", map[string]bool{"HAS": true}, []string{"has"}, true},
-		{"unrelated reported name", map[string]bool{"zzzz": true}, []string{"has"}, false},
-		{"no reported names", map[string]bool{}, []string{"has"}, false},
-		{"no macros", map[string]bool{"hsa": true}, nil, false},
+		{"near-miss typo", map[string]bool{msHsa: true}, []string{lnHasMacro}, true},
+		{"exact macro name", map[string]bool{lnHasMacro: true}, []string{lnHasMacro}, true},
+		{"case-insensitive typo", map[string]bool{"HAS": true}, []string{lnHasMacro}, true},
+		{"unrelated reported name", map[string]bool{"zzzz": true}, []string{lnHasMacro}, false},
+		{"no reported names", map[string]bool{}, []string{lnHasMacro}, false},
+		{"no macros", map[string]bool{msHsa: true}, nil, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -248,7 +351,7 @@ func TestMsReportedMacroTypo(t *testing.T) {
 // undeclared name was already reported by the misspell rule is dropped.
 func TestMsDropRedundantDropsReportedUndeclared(t *testing.T) {
 	content := `userNme`
-	ms := msFinding(content, "userNme", celtlint.CodeUnknownIdentifier)
+	ms := msFinding(content, msUserNme, celtlint.CodeUnknownIdentifier)
 	reported := ReportedNames([]celtlint.Finding{ms}, content)
 	compile := celtlint.Finding{
 		Level:  celtlint.LevelError,
@@ -265,7 +368,7 @@ func TestMsDropRedundantDropsReportedUndeclared(t *testing.T) {
 // not reported by the misspell rule survives dedup.
 func TestMsDropRedundantKeepsUnreportedUndeclared(t *testing.T) {
 	content := `qqqqzz`
-	reported := map[string]bool{"userNme": true}
+	reported := map[string]bool{msUserNme: true}
 	compile := celtlint.Finding{
 		Level:  celtlint.LevelError,
 		Code:   celtlint.CodeUndeclaredReference,
@@ -294,15 +397,18 @@ func TestMsDropRedundantDropsReportedUndefinedField(t *testing.T) {
 	}
 }
 
-// TestMsDropRedundantDropsEnumMemberRef verifies an undeclared enum type used
-// as a qualified member (Color.RED) is dropped.
-func TestMsDropRedundantDropsEnumMemberRef(t *testing.T) {
+// TestMsDropRedundantKeepsUncoveredEnumMemberRef verifies an undeclared enum
+// type used as a qualified member (Color.RED) is kept when no finding covers
+// that occurrence: the compiler error is only suppressed when another finding
+// actually reports the same name (a bare short enum name without a container
+// does not resolve, so its error must not be hidden).
+func TestMsDropRedundantKeepsUncoveredEnumMemberRef(t *testing.T) {
 	idx := msEnumIndex(t)
 	content := `Color.RED`
 	compile := celtlint.Finding{Code: celtlint.CodeUndeclaredReference, Detail: "undeclared reference to `Color`"}
 	out := DropRedundantCompileErrors([]celtlint.Finding{compile}, content, idx, map[string]bool{})
-	if len(out) != 0 {
-		t.Fatalf("DropRedundant = %d findings, want 0 (enum member ref)", len(out))
+	if len(out) != 1 {
+		t.Fatalf("DropRedundant = %d findings, want 1 (kept; no finding covers Color)", len(out))
 	}
 }
 
@@ -323,7 +429,7 @@ func TestMsDropRedundantKeepsEnumTypeAlone(t *testing.T) {
 func TestMsDropRedundantDropsMacroTypo(t *testing.T) {
 	idx := msMacroIndex(t)
 	compile := celtlint.Finding{Code: celtlint.CodeCompileError, Detail: "unknown function has() called"}
-	out := DropRedundantCompileErrors([]celtlint.Finding{compile}, "", idx, map[string]bool{"hsa": true})
+	out := DropRedundantCompileErrors([]celtlint.Finding{compile}, "", idx, map[string]bool{msHsa: true})
 	if len(out) != 0 {
 		t.Fatalf("DropRedundant = %d findings, want 0 (macro typo deduped)", len(out))
 	}

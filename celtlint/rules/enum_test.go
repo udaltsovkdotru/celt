@@ -20,6 +20,7 @@ const (
 	enRoleType    = "test.Role"
 	enStatusShort = "Status"
 	enRoleShort   = "Role"
+	enActiveConst = "test.Status.ACTIVE"
 )
 
 // Rule names used by the local test rules that drive the enum checks.
@@ -352,8 +353,8 @@ func TestRawEnumValueFlagsNumericLiteral(t *testing.T) {
 	if f.Hint != "prefer a named enum value over a numeric literal" {
 		t.Errorf("Hint = %q, want %q", f.Hint, "prefer a named enum value over a numeric literal")
 	}
-	if f.Fix != "Status.ACTIVE" {
-		t.Errorf("Fix = %q, want %q", f.Fix, "Status.ACTIVE")
+	if f.Fix != enActiveConst {
+		t.Errorf("Fix = %q, want %q", f.Fix, enActiveConst)
 	}
 	// The fix must target the integer literal (char 12-13), not the enum
 	// operand `p.status` (char 0-7).
@@ -362,6 +363,102 @@ func TestRawEnumValueFlagsNumericLiteral(t *testing.T) {
 	}
 	if f.Level != celtlint.LevelWarn {
 		t.Errorf("Level = %v, want warn", f.Level)
+	}
+	// The fix must resolve in the environment: a bare short enum name
+	// (Status.ACTIVE) is an undeclared reference when no container is
+	// configured, so the emitted name must be fully qualified.
+	if _, iss := enEnv(t).Compile(`p.status == ` + f.Fix); iss != nil && iss.Err() != nil {
+		t.Errorf("fix %q does not resolve: %v", f.Fix, iss.Err())
+	}
+}
+
+func TestRawEnumFixPreservesResolvedConstant(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		option      cel.EnvOption
+		shadowValue int32
+		mustFix     bool
+	}{
+		{name: "container", option: cel.Container("prod"), shadowValue: 9, mustFix: true},
+		{name: "abbreviation with different value", option: cel.Abbrevs("prod.test"), shadowValue: 9},
+		{name: "abbreviation with equal value", option: cel.Abbrevs("prod.test"), shadowValue: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			enAssertRawEnumFix(t, tc.option, tc.shadowValue, tc.mustFix)
+		})
+	}
+}
+
+func enAssertRawEnumFix(t *testing.T, option cel.EnvOption, shadowValue int32, mustFix bool) {
+	t.Helper()
+	fdset := enFDSet()
+	shadow := proto.CloneOf(fdset.File[0])
+	shadow.Name = proto.String("shadow.proto")
+	shadow.Package = proto.String("prod.test")
+	shadow.MessageType = nil
+	shadow.EnumType = shadow.EnumType[:1]
+	shadow.EnumType[0].Value[1].Number = proto.Int32(shadowValue)
+	fdset.File = append(fdset.File, shadow)
+
+	env, err := cel.NewEnv(cel.TypeDescs(fdset), option, cel.Variable("p", cel.ObjectType(enPersonType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := celtlint.New(env, celtlint.WithDescriptor(fdset), celtlint.WithRules(enRawEnumRule{RuleMeta: celtlint.RuleMeta{
+		Name: enRawEnumName, Defaults: celtlint.RuleParams{Level: celtlint.LevelWarn},
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `p.status == 1`
+	findings := a.Analyze("enum.cel", src)
+	if _, ok := enFindByCode(findings, celtlint.CodeRawEnumValue); !ok {
+		t.Fatalf("expected a raw enum finding; got %+v", findings)
+	}
+	fixed, _, changed := celtlint.ApplyFixes(src, findings)
+	if !changed {
+		if mustFix {
+			t.Error("expected an enum fix")
+		}
+		return
+	}
+	checked, issues := env.Compile(fixed)
+	if err := issues.Err(); err != nil {
+		t.Fatalf("fixed expression %q does not compile: %v", fixed, err)
+	}
+	for _, ref := range checked.NativeRep().ReferenceMap() {
+		if ref.Name == enActiveConst && ref.Value != nil && ref.Value.Value() == int64(1) {
+			return
+		}
+	}
+	t.Errorf("fixed expression %q does not refer to %s with value 1", fixed, enActiveConst)
+}
+
+func TestRawEnumFixesNestedComparisonsInOnePass(t *testing.T) {
+	env := enEnv(t)
+	a, err := celtlint.New(env, celtlint.WithDescriptor(enFDSet()), celtlint.WithRules(enRawEnumRule{RuleMeta: celtlint.RuleMeta{
+		Name: enRawEnumName, Defaults: celtlint.RuleParams{Level: celtlint.LevelWarn},
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const src = `(p.status == 1 ? p : q).status == 2`
+	if _, issues := env.Compile(src); issues.Err() != nil {
+		t.Fatalf("invalid test expression: %v", issues.Err())
+	}
+	findings := a.Analyze("enum.cel", src)
+	if len(findings) != 2 {
+		t.Errorf("expected one finding per comparison, got %+v", findings)
+	}
+	fixed, _, changed := celtlint.ApplyFixes(src, findings)
+	if !changed {
+		t.Fatal("expected fixes")
+	}
+	if _, issues := env.Compile(fixed); issues.Err() != nil {
+		t.Fatalf("fixed expression %q does not compile: %v", fixed, issues.Err())
+	}
+	if remaining := a.Analyze("enum.cel", fixed); len(remaining) != 0 {
+		t.Errorf("one fix pass left findings in %q: %+v", fixed, remaining)
 	}
 }
 
@@ -375,8 +472,8 @@ func TestRawEnumValueRightSideNumericLiteral(t *testing.T) {
 	if !ok {
 		t.Fatalf("no raw-enum-value finding in %+v", fs)
 	}
-	if f.Fix != "Status.INACTIVE" {
-		t.Errorf("Fix = %q, want %q (value 2 of Status)", f.Fix, "Status.INACTIVE")
+	if f.Fix != "test.Status.INACTIVE" {
+		t.Errorf("Fix = %q, want %q (value 2 of Status)", f.Fix, "test.Status.INACTIVE")
 	}
 	// The fix must target the integer literal (char 0-1), not the enum operand.
 	if f.FixStart.Line != 0 || f.FixStart.Char != 0 || f.FixEnd.Line != 0 || f.FixEnd.Char != 1 {
@@ -400,8 +497,8 @@ func TestRawEnumValueSpanInMacroExpandedExpr(t *testing.T) {
 	if !ok {
 		t.Fatalf("no raw-enum-value finding in %+v", fs)
 	}
-	if f.Fix != "Status.ACTIVE" {
-		t.Errorf("Fix = %q, want %q (value 1 of Status)", f.Fix, "Status.ACTIVE")
+	if f.Fix != enActiveConst {
+		t.Errorf("Fix = %q, want %q (value 1 of Status)", f.Fix, enActiveConst)
 	}
 	// The literal `1` is on line 1 (0-indexed), chars 17-18 of
 	// "  && p.status == 1". The fix must target it, not a node on another line.
@@ -536,6 +633,40 @@ func TestEnumTypeMismatchFlagsConstantVsDifferentEnum(t *testing.T) {
 	}
 	if f.Level != celtlint.LevelError {
 		t.Errorf("Level = %v, want error", f.Level)
+	}
+}
+
+func TestRepeatedEnumComparisonsAreListComparisons(t *testing.T) {
+	fdset := enFDSet()
+	person := fdset.File[0].MessageType[0]
+	person.Field = append(person.Field, &descriptorpb.FieldDescriptorProto{
+		Name: proto.String("states"), Number: proto.Int32(16), TypeName: proto.String("." + enStatusType),
+		Label: descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum(), Type: descriptorpb.FieldDescriptorProto_TYPE_ENUM.Enum(),
+	})
+	env, err := cel.NewEnv(cel.TypeDescs(fdset), cel.Variable("p", cel.ObjectType(enPersonType)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := celtlint.New(env, celtlint.WithDescriptor(fdset), celtlint.WithRules(All()...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range []string{"p.states == []", "p.states == [0]", "p.states == p.states"} {
+		if _, issues := env.Compile(src); issues.Err() != nil {
+			t.Fatalf("invalid list comparison fixture %q: %v", src, issues.Err())
+		}
+		if f, ok := enFindByCode(a.Analyze("test.cel", src), celtlint.CodeOddComparison); ok {
+			t.Errorf("valid list comparison %q received scalar enum finding: %+v", src, f)
+		}
+	}
+}
+
+func TestEnumTypeMismatchFlagsConstantsFromDifferentEnums(t *testing.T) {
+	fs := enAnalyze(t, enEnumMismatchRule{RuleMeta: celtlint.RuleMeta{
+		Name: enEnumMismName, Defaults: celtlint.RuleParams{Level: celtlint.LevelError},
+	}}, `test.Status.ACTIVE == test.Role.ADMIN`)
+	if f, ok := enFindByCode(fs, celtlint.CodeOddComparison); !ok || !f.IsError() {
+		t.Errorf("two constants from different enum types should produce a mismatch error: %+v", fs)
 	}
 }
 
