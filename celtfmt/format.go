@@ -262,7 +262,7 @@ func (p *printer) render(n node) {
 		p.renderCond(t)
 	case *paren:
 		inline := "(" + inlineNode(t.x) + ")"
-		if p.inlineFits(inline, t) {
+		if canInline(t) && p.inlineFits(inline, t) {
 			p.write(inline)
 			return
 		}
@@ -278,7 +278,7 @@ func (p *printer) render(n node) {
 
 func (p *printer) renderCall(t *call) {
 	inline := inlineCall(t)
-	if !p.forceBrokenCall && p.inlineFits(inline, t) {
+	if !p.forceBrokenCall && canInline(t) && p.inlineFits(inline, t) {
 		p.write(inline)
 		return
 	}
@@ -313,7 +313,7 @@ func (p *printer) renderCallArg(i int, av callArg, freshLine bool) bool {
 		return true
 	default:
 		inline := inlineNode(a)
-		fitsInline := p.inlineFits(inline, a)
+		fitsInline := canInline(a) && p.inlineFits(inline, a)
 		if freshLine {
 			p.newline()
 		} else if !isSimpleArg(a) {
@@ -412,7 +412,7 @@ func (p *printer) renderedBrokenClose(before int) bool {
 
 func (p *printer) renderList(t *listLit) {
 	inline := inlineList(t)
-	if p.inlineFits(inline, t) {
+	if canInline(t) && p.inlineFits(inline, t) {
 		p.write(inline)
 		return
 	}
@@ -421,7 +421,7 @@ func (p *printer) renderList(t *listLit) {
 
 func (p *printer) renderMap(t *mapLit) {
 	inline := inlineMap(t)
-	if p.inlineFits(inline, t) {
+	if canInline(t) && p.inlineFits(inline, t) {
 		p.write(inline)
 		return
 	}
@@ -474,7 +474,7 @@ func elemText(e elem) string {
 
 func (p *printer) renderCond(t *cond) {
 	inline := inlineCond(t)
-	if p.inlineFits(inline, t) {
+	if canInline(t) && p.inlineFits(inline, t) {
 		p.write(inline)
 		return
 	}
@@ -494,7 +494,7 @@ type binItem struct {
 
 func (p *printer) renderBin(t *bin) {
 	inline := inlineNode(t)
-	if p.inlineFits(inline, t) {
+	if canInline(t) && p.inlineFits(inline, t) {
 		p.write(inline)
 		return
 	}
@@ -546,7 +546,7 @@ func (p *printer) renderAndItem(i int, it binItem, prevOperand node, hang bool) 
 	}
 	if x := hasField(prevOperand); x != nil && contains(operand, x) {
 		seg := " " + it.op + " " + inlineNode(operand)
-		if p.fits(seg) {
+		if canInline(operand) && p.fits(seg) {
 			p.write(seg)
 			return false
 		}
@@ -567,7 +567,7 @@ func (p *printer) renderAndItem(i int, it binItem, prevOperand node, hang bool) 
 	}
 	if hang {
 		seg := " " + it.op + " " + inlineNode(operand)
-		if p.fits(seg) {
+		if canInline(operand) && p.fits(seg) {
 			p.write(seg)
 			return p.curLineEndsWithClose()
 		}
@@ -705,6 +705,49 @@ func inlineCall(t *call) string {
 		args = append(args, s)
 	}
 	return fmt.Sprintf("%s(%s)", inlineNode(t.name), strings.Join(args, ", "))
+}
+
+// canInline reports whether n can be rendered on a single line. A node that
+// (transitively) contains a trailing `//` comment cannot: CEL has no block
+// comments, so joining such a comment onto one line would let it swallow the
+// rest of the line (e.g. `["a" // note, "b"]` drops "b"). Such a node must be
+// laid out multi-line so each comment stays at the end of its own line.
+func canInline(n node) bool {
+	switch t := n.(type) {
+	case *listLit:
+		for _, e := range t.elems {
+			if e.comment != "" || !canInline(e.value) {
+				return false
+			}
+		}
+		return true
+	case *mapLit:
+		for _, e := range t.elems {
+			if e.comment != "" || !canInline(e.value) || (e.key != nil && !canInline(e.key)) {
+				return false
+			}
+		}
+		return true
+	case *call:
+		for _, a := range t.args {
+			if a.comment != "" || !canInline(a.value) {
+				return false
+			}
+		}
+		return canInline(t.name)
+	case *cond:
+		return canInline(t.c) && canInline(t.t) && canInline(t.f)
+	case *bin:
+		return canInline(t.l) && canInline(t.r)
+	case *un:
+		return canInline(t.x)
+	case *paren:
+		return canInline(t.x)
+	case *idx:
+		return canInline(t.obj) && canInline(t.index)
+	default: // ident, lit, sel
+		return true
+	}
 }
 
 func inlineList(t *listLit) string {

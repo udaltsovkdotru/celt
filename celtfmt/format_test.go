@@ -387,3 +387,37 @@ func TestFormatIdempotent(t *testing.T) {
 		})
 	}
 }
+
+func TestFormatKeepsTrailingCommentBlocks(t *testing.T) {
+	// A list/map whose elements carry trailing `//` comments must stay
+	// multi-line. CEL has no block comments, so collapsing such a block onto
+	// one line (e.g. `["a" // first, "b"]`) would let the comment swallow the
+	// rest of the line and silently drop the remaining elements.
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "list",
+			src:  "foo([\n  \"a\", // first\n  \"b\", // second\n])",
+			want: "foo([\n  \"a\", // first\n  \"b\", // second\n])\n",
+		},
+		{
+			name: "map",
+			src:  "foo({\n  a: 1, // first\n  b: 2, // second\n})",
+			want: "foo({\n  a: 1, // first\n  b: 2, // second\n})\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Format(tt.src, nil)
+			if err != nil {
+				t.Fatalf("Format: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("Format = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
