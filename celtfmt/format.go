@@ -498,12 +498,22 @@ func (p *printer) renderCallArgContainer(open, closing byte, elems []elem, comme
 		p.newline()
 	}
 	p.write(string(open))
+	// When the container is not the first argument it starts on its own line at
+	// the argument-body indent, so its elements are indented one level further
+	// and it closes at the argument-body indent. When it is the first argument
+	// its `[` sits on the call's `(` line, so elements sit at the argument-body
+	// indent and it closes one level shallower.
+	if i > 0 {
+		p.indent++
+	}
 	p.newline()
 	p.renderElemLines(elems)
 	p.indent--
 	p.newline()
 	p.write(string(closing))
-	p.indent++
+	if i == 0 {
+		p.indent++
+	}
 	if !last {
 		p.write(",")
 	}
