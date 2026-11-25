@@ -1,6 +1,7 @@
 package celtfmt
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -509,6 +510,29 @@ func TestFormatCallArgsPackOnSharedLine(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("FormatExpr = %q, want %q", got, want)
+	}
+}
+
+// TestComparisonStaysOnSingleLine verifies that a comparison is kept on one
+// line even when it exceeds the configured width, rather than being broken
+// apart (operator at the end of one line, right operand on the next). This
+// holds for every comparison operator.
+func TestComparisonStaysOnSingleLine(t *testing.T) {
+	for _, op := range []string{"==", "!=", "<", "<=", ">", ">="} {
+		op := op
+		t.Run(op, func(t *testing.T) {
+			left := "rule.some_object.some_long_field_name.some_value"
+			right := `"some-text-value"`
+			src := fmt.Sprintf("%s %s %s", left, op, right)
+			want := fmt.Sprintf("%s %s %s", left, op, right)
+			got, err := FormatExpr(src, fmtConfigOf(fmtWidth(60)))
+			if err != nil {
+				t.Fatalf("FormatExpr: %v", err)
+			}
+			if got != want {
+				t.Errorf("FormatExpr(%s) = %q, want %q", op, got, want)
+			}
+		})
 	}
 }
 

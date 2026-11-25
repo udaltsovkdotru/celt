@@ -755,6 +755,13 @@ func (p *printer) renderBin(t *bin) {
 		p.renderChain(t)
 		return
 	}
+	// A comparison is never broken apart: keeping `a == b` on a single line is
+	// more readable than splitting the operator from its operands, so it may
+	// exceed the configured width rather than add a line break.
+	if isComparisonOp(t.op) && canInline(t) {
+		p.write(inline)
+		return
+	}
 	p.render(t.l)
 	if isComparisonOp(t.op) {
 		p.writef(" %s ", t.op)
