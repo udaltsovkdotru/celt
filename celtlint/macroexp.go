@@ -203,19 +203,35 @@ func commentStartOnLine(content string, i int) int {
 // the result type recovered from a re-parse (empty otherwise).
 func macroExpansion(checked *celast.AST, content string, _ []int, env *cel.Env, id int64, start, end int) (expansion, reparsedType string) {
 	if node, ok := findExprByID(checked.Expr(), id); ok {
-		if s, handled := unparseExpansion(node); handled && compiles(env, s) {
-			return s, ""
+		if s, handled := unparseExpansion(node, checked); handled {
+			// A comprehension macro is rendered as-is from its tracked call, so
+			// it may legitimately reference bind-scoped variables that do not
+			// compile in the top-level env (e.g. a comprehension macro inside a
+			// cel.bind). Do not require it to re-compile standalone.
+			if node.Kind() == celast.ComprehensionKind || compiles(env, s) {
+				return s, ""
+			}
 		}
 	}
+	return reparseMacroExpansion(checked, content, env, id, start, end)
+}
+
+// reparseMacroExpansion re-expands a macro whose node was consumed by an
+// enclosing macro. The full call is rebuilt from the original macro-call node
+// (keeping a receiver macro's receiver, e.g.
+// `recv.some_receiver_macro(...)`, so it re-parses as a standalone
+// expression) and re-compiled with the env to regenerate the
+// expansion.
+func reparseMacroExpansion(checked *celast.AST, content string, env *cel.Env, id int64, start, end int) (expansion, reparsedType string) {
 	callText := ""
-	if start >= 0 && start <= end && end <= len(content) {
+	if original, ok := checked.SourceInfo().GetMacroCall(id); ok {
+		if s, uerr := parser.Unparse(original, checked.SourceInfo()); uerr == nil {
+			callText = s
+		}
+	}
+	if callText == "" && start >= 0 && start <= end && end <= len(content) {
 		callText = content[start:end]
 	}
-	// A receiver macro's span starts at the method name without its receiver
-	// (e.g. `all(x, x>0)` from `[1].all(...)`), which is not a valid standalone
-	// expression, and the desugared form (a comprehension) cannot be rendered.
-	// Omit the expansion rather than publish a fragment or the original call,
-	// neither of which is a genuine expansion.
 	if env == nil || callText == "" || !compiles(env, callText) {
 		return "", ""
 	}
@@ -227,7 +243,7 @@ func macroExpansion(checked *celast.AST, content string, _ []int, env *cel.Env, 
 	if root == nil {
 		return "", ""
 	}
-	if s, handled := unparseExpansion(root); handled {
+	if s, handled := unparseExpansion(root, ast.NativeRep()); handled {
 		return s, celTypeName(ast.OutputType())
 	}
 	return "", ""
@@ -246,15 +262,15 @@ func compiles(env *cel.Env, s string) bool {
 // (so the actual expansion is shown, not the original call). A presence test
 // (has(x.f)) has no textual form other than has(...), so it yields no distinct
 // expansion. The bool reports whether the node was handled.
-func unparseExpansion(node celast.Expr) (string, bool) {
+func unparseExpansion(node celast.Expr, checked *celast.AST) (string, bool) {
 	if node.Kind() == celast.SelectKind && node.AsSelect().IsTestOnly() {
 		return "", true
 	}
-	s, err := parser.Unparse(node, macroFreeInfo())
-	if err != nil || s == "" {
-		return "", false
-	}
-	return s, true
+	// Rendering recurses through any comprehension the expansion contains,
+	// rendering each back to the macro call that produced it (as-is), so an
+	// expansion is shown even when it wraps or nests comprehension macros (e.g.
+	// a macro expanding to cel.bind, or a receiver comprehension macro).
+	return renderExpr(node, checked)
 }
 
 func macroFreeInfo() *celast.SourceInfo {

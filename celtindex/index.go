@@ -858,6 +858,23 @@ func (ix *Index) ReceiverTypeName(receiver string) string {
 	return cur
 }
 
+// ChainTypeName resolves baseType followed by the dotted field chain to the
+// final type name by walking the field-type index, so a receiver rooted at a
+// locally bound variable (which is not in the global variable index) can be
+// typed the same way ReceiverTypeName types one rooted at a global. It returns
+// "" when any step of the chain is missing.
+func (ix *Index) ChainTypeName(baseType string, chain []string) string {
+	cur := baseType
+	for _, field := range chain {
+		child, ok := ix.fieldTypes[cur][field]
+		if !ok {
+			return ""
+		}
+		cur = child
+	}
+	return cur
+}
+
 // ReceiverElem returns the element type of a repeated-field or string-field
 // receiver, if any, used to scope member-function completions.
 func (ix *Index) ReceiverElem(receiver string) string {

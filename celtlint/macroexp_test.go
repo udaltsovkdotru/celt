@@ -9,12 +9,17 @@ import (
 	celast "cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/operators"
 	celtypes "cel.dev/cel-go/common/types"
+	"cel.dev/cel-go/ext"
 	"cel.dev/cel-go/parser"
 
 	"github.com/udaltsovkdotru/celt/celtsource"
 )
 
 const boolTypeName = "bool"
+
+// bindRenderSrc is a cel.bind expression reused by the bind-rendering tests so
+// the literal is not repeated (goconst).
+const bindRenderSrc = `cel.bind(secret, "hello", secret == userName)`
 
 // testMacroEnv builds an env with a passthrough signature-only macro and macro
 // call tracking enabled, mirroring how the config package registers macros.
@@ -156,7 +161,7 @@ func TestMacroCallSpanIgnoresSlashesInsidePrecedingString(t *testing.T) {
 	}
 }
 
-func TestReceiverMacroDoesNotReportOriginalCallAsExpansion(t *testing.T) {
+func TestReceiverMacroShowsAsIsExpansion(t *testing.T) {
 	env, err := cel.NewEnv(cel.EnableMacroCallTracking())
 	if err != nil {
 		t.Fatal(err)
@@ -170,9 +175,10 @@ func TestReceiverMacroDoesNotReportOriginalCallAsExpansion(t *testing.T) {
 	if len(calls) != 1 || calls[0].Name != "all" {
 		t.Fatalf("expected tracked all call: %+v", calls)
 	}
-	expansion := strings.Join(strings.Fields(calls[0].Expansion), "")
-	if expansion == strings.TrimPrefix(content, "[1,2].") || expansion == content {
-		t.Errorf("reported original source, not an expansion: %q", calls[0].Expansion)
+	// A comprehension macro is rendered as its own call (as-is), so hovering it
+	// surfaces the macro's own form.
+	if expansion := strings.Join(strings.Fields(calls[0].Expansion), ""); expansion != "[1,2].all(x,x>0)" {
+		t.Errorf("Expansion = %q, want the as-is macro form %q", calls[0].Expansion, "[1,2].all(x,x>0)")
 	}
 }
 
@@ -304,5 +310,232 @@ func TestMacroHas(t *testing.T) {
 	}
 	if mc.Expansion != "" {
 		t.Errorf("Expansion = %q, want empty (presence test has no textual expansion)", mc.Expansion)
+	}
+}
+
+// listContainsMacro expands <recv>.list_contains(values) into a single
+// comprehension over the receiver list:
+//
+//	<recv>.exists(x, x in values)
+func listContainsMacro(eh parser.ExprHelper, target celast.Expr, args []celast.Expr) (celast.Expr, *common.Error) {
+	accu := eh.AccuIdentName()
+	item := eh.NewIdent("x")
+	return eh.NewComprehension(
+		target,
+		"x",
+		accu,
+		eh.NewLiteral(celtypes.False),
+		eh.NewCall(operators.NotStrictlyFalse, eh.NewCall(operators.LogicalNot, eh.NewAccuIdent())),
+		eh.NewCall(operators.LogicalOr, eh.NewAccuIdent(), eh.NewCall(operators.In, item, args[0])),
+		eh.NewAccuIdent(),
+	), nil
+}
+
+// TestMacroReceiverComprehensionExpansion verifies that a receiver macro whose
+// expansion is a comprehension is shown as-is (its own call form), without
+// being desugared into a guessed shape.
+func TestMacroReceiverComprehensionExpansion(t *testing.T) {
+	env, err := cel.NewEnv(
+		cel.EnableMacroCallTracking(),
+		cel.Macros(parser.NewReceiverMacro("list_contains", 1, listContainsMacro)),
+		cel.Variable("xs", cel.ListType(cel.StringType)),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	content := `xs.list_contains(["a"])`
+	ast, iss := env.Compile(content)
+	if iss != nil && iss.Err() != nil {
+		t.Fatalf("Compile: %v", iss.Err())
+	}
+	ro := celtsource.RuneOffsets(content)
+	mc, ok := MacroCallAt(ast.NativeRep(), ro, content, env, 3)
+	if !ok {
+		t.Fatal("MacroCallAt: list_contains not found")
+	}
+	// The expansion is the macro's own call form, shown as-is.
+	if want := `xs.list_contains(["a"])`; mc.Expansion != want {
+		t.Errorf("Expansion = %q, want %q", mc.Expansion, want)
+	}
+}
+
+// TestRenderStandardComprehensions verifies the standard comprehension shapes
+// are rendered back into their macro form by the renderer.
+func TestRenderStandardComprehensions(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"exists", `[1, 2].exists(x, x > 1)`, `[1, 2].exists(x, x > 1)`},
+		{"all", `[1, 2].all(x, x > 0)`, `[1, 2].all(x, x > 0)`},
+		{"map", `[1, 2].map(x, x * 2)`, `[1, 2].map(x, x * 2)`},
+		{"filter", `[1, 2].filter(x, x > 1)`, `[1, 2].filter(x, x > 1)`},
+		{"exists_one", `[1, 2].exists_one(x, x == 1)`, `[1, 2].exists_one(x, x == 1)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env, err := cel.NewEnv(cel.EnableMacroCallTracking())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ast, iss := env.Compile(tt.src)
+			if iss != nil && iss.Err() != nil {
+				t.Fatalf("Compile: %v", iss.Err())
+			}
+			native := ast.NativeRep()
+			ro := celtsource.RuneOffsets(tt.src)
+			calls := MacroCallsIn(native, ro, tt.src, env)
+			if len(calls) != 1 {
+				t.Fatalf("MacroCallsIn = %d, want 1", len(calls))
+			}
+			node, ok := findExprByID(native.Expr(), calls[0].ID)
+			if !ok || node.Kind() != celast.ComprehensionKind {
+				t.Fatalf("expansion node not found or not a comprehension")
+			}
+			got, ok := renderComprehension(node, native)
+			if !ok || got != tt.want {
+				t.Errorf("renderComprehension = %q (ok=%v), want %q", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+// TestRenderBindComprehension verifies a cel.bind comprehension (whose loop
+// step is the accumulator identity) renders back to its `cel.bind` form.
+func TestRenderBindComprehension(t *testing.T) {
+	env, err := cel.NewEnv(cel.EnableMacroCallTracking(), ext.Bindings(),
+		cel.Variable("userName", cel.StringType))
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	src := bindRenderSrc
+	ast, iss := env.Compile(src)
+	if iss != nil && iss.Err() != nil {
+		t.Fatalf("Compile: %v", iss.Err())
+	}
+	native := ast.NativeRep()
+	ro := celtsource.RuneOffsets(src)
+	calls := MacroCallsIn(native, ro, src, env)
+	if len(calls) != 1 {
+		t.Fatalf("MacroCallsIn = %d, want 1", len(calls))
+	}
+	node, ok := findExprByID(native.Expr(), calls[0].ID)
+	if !ok || node.Kind() != celast.ComprehensionKind {
+		t.Fatalf("expansion node not found or not a comprehension")
+	}
+	got, ok := renderComprehension(node, native)
+	if !ok {
+		t.Fatalf("renderComprehension failed for cel.bind")
+	}
+	if want := bindRenderSrc; got != want {
+		t.Errorf("renderComprehension = %q, want %q", got, want)
+	}
+}
+
+// wrapMacro expands wrap(cond, val) to `cond ? val : 0`, so its expansion is a
+// non-comprehension node that can contain a comprehension in its first argument
+// (mirroring a macro wrapping a comprehension).
+func wrapMacro(eh parser.ExprHelper, _ celast.Expr, args []celast.Expr) (celast.Expr, *common.Error) {
+	zero := eh.NewLiteral(celtypes.Int(0))
+	return eh.NewCall(operators.Conditional, args[0], args[1], zero), nil
+}
+
+// TestMacroWrappingComprehensionExpansion verifies a macro whose expansion is
+// not itself a comprehension but contains one (a macro wrapping a cel.bind) is
+// rendered with the nested comprehension desugared, not dropped.
+func TestMacroWrappingComprehensionExpansion(t *testing.T) {
+	env, err := cel.NewEnv(
+		cel.EnableMacroCallTracking(),
+		ext.Bindings(),
+		cel.Macros(parser.NewGlobalMacro("wrap", 2, wrapMacro)),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	const src = `wrap(cel.bind(secret, "hello", secret == "hello"), 1)`
+	ast, iss := env.Compile(src)
+	if iss != nil && iss.Err() != nil {
+		t.Fatalf("Compile: %v", iss.Err())
+	}
+	native := ast.NativeRep()
+	calls := MacroCallsIn(native, celtsource.RuneOffsets(src), src, env)
+	var wrapExp string
+	for _, mc := range calls {
+		if mc.Name == "wrap" {
+			wrapExp = mc.Expansion
+		}
+	}
+	if want := `cel.bind(secret, "hello", secret == "hello") ? 1 : 0`; wrapExp != want {
+		t.Errorf("wrap expansion = %q, want %q", wrapExp, want)
+	}
+}
+
+// pickMacro expands pick(cond, val) to `cond ? val : 0`, a non-comprehension
+// macro used to check that such macros appearing inside a comprehension are
+// themselves expanded when the comprehension is rendered.
+func pickMacro(eh parser.ExprHelper, _ celast.Expr, args []celast.Expr) (celast.Expr, *common.Error) {
+	zero := eh.NewLiteral(celtypes.Int(0))
+	return eh.NewCall(operators.Conditional, args[0], args[1], zero), nil
+}
+
+// TestComprehensionExpandsNonComprehensionMacroArgs verifies that when a
+// comprehension's sub-expression (range or predicate) is itself a
+// non-comprehension macro, that macro is expanded too — the recursion continues
+// until the sub-expression has no macros left (or hits a comprehension macro,
+// which a direct-only renderer cannot reconstruct).
+func TestComprehensionExpandsNonComprehensionMacroArgs(t *testing.T) {
+	env, err := cel.NewEnv(
+		cel.EnableMacroCallTracking(),
+		cel.Macros(parser.NewGlobalMacro("pick", 2, pickMacro)),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	// The `map` macro's predicate is a `pick` call that desugars to a
+	// conditional; the rendered comprehension must show that expansion, not the
+	// raw `pick(...)`.
+	const src = `[1,2].map(x, pick(x > 0, x))`
+	ast, iss := env.Compile(src)
+	if iss != nil && iss.Err() != nil {
+		t.Fatalf("Compile: %v", iss.Err())
+	}
+	native := ast.NativeRep()
+	calls := MacroCallsIn(native, celtsource.RuneOffsets(src), src, env)
+	var mapExp string
+	for _, mc := range calls {
+		if mc.Name == "map" {
+			mapExp = mc.Expansion
+		}
+	}
+	if want := `[1, 2].map(x, (x > 0) ? x : 0)`; mapExp != want {
+		t.Errorf("map expansion = %q, want %q", mapExp, want)
+	}
+}
+
+// TestComprehensionNestedMacroArgRendersAsIs verifies that a comprehension
+// whose argument is itself a comprehension macro is rendered as-is: the outer
+// macro keeps its own call form and the nested macro is shown as its own call.
+func TestComprehensionNestedMacroArgRendersAsIs(t *testing.T) {
+	env, err := cel.NewEnv(cel.EnableMacroCallTracking())
+	if err != nil {
+		t.Fatalf("NewEnv: %v", err)
+	}
+	const src = `[1,2].exists(x, [3,4].all(y, y > x))`
+	ast, iss := env.Compile(src)
+	if iss != nil && iss.Err() != nil {
+		t.Fatalf("Compile: %v", iss.Err())
+	}
+	native := ast.NativeRep()
+	ro := celtsource.RuneOffsets(src)
+	calls := MacroCallsIn(native, ro, src, env)
+	var existsExp string
+	for _, mc := range calls {
+		if mc.Name == "exists" {
+			existsExp = mc.Expansion
+		}
+	}
+	if want := `[1, 2].exists(x, [3, 4].all(y, y > x))`; existsExp != want {
+		t.Errorf("exists expansion = %q, want %q", existsExp, want)
 	}
 }

@@ -1,11 +1,11 @@
 package celtlint
 
 import (
+	"strings"
 	"sync"
 
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/common"
-	celast "cel.dev/cel-go/common/ast"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/udaltsovkdotru/celt/celtfmt"
@@ -246,17 +246,21 @@ func (a *Analyzer) Hover(content string, line, char int) string {
 		}
 	}
 	// The token must be a genuine identifier reference: text inside a string
-	// literal and a comprehension-local binding (which shadows any same-named
-	// global) must not surface the global's documentation.
-	if insideString(content, off) || a.isComprehensionLocal(content, off, name) {
+	// literal is not one, and a locally bound variable (cel.bind variable or
+	// comprehension iter/accu, which shadows any same-named global) surfaces its
+	// own type rather than the global's documentation.
+	if insideString(content, off) {
 		return ""
+	}
+	if lb, ok := a.localBindingNamed(content, off, name); ok {
+		return lb.hover()
 	}
 	// Field hover is resolved by the receiver's type so fields sharing a bare
 	// name across messages (Person.name vs Company.name) don't collide, and
 	// indexed/complex receivers (`[person][0]`) resolve to the element type.
 	if dot := receiverDotAt(content, lineStart, off); dot >= 0 {
 		if recv, ok := receiverTextBefore(content, lineStart, dot); ok {
-			if t := a.resolveReceiverType(recv); t != "" {
+			if t := a.resolveReceiverTypeAt(content, dot, recv); t != "" {
 				if d, ok := a.docs.fieldFor(t, name); ok {
 					return renderHover(d)
 				}
@@ -284,38 +288,24 @@ func insideString(content string, off int) bool {
 	return false
 }
 
-// isComprehensionLocal reports whether the identifier named name at byte offset
-// off is bound as a comprehension local (iter/accu/second-iter variable), in
-// which case it shadows any same-named global and must not surface that
-// global's documentation.
-func (a *Analyzer) isComprehensionLocal(content string, off int, name string) bool {
-	if name == "" || a.env == nil {
-		return false
+// resolveReceiverTypeAt resolves the CEL type name of a receiver expression that
+// ends at the member-select dot offset dot, taking locally bound variables
+// (cel.bind variables and comprehension iter/accu) into account in addition to
+// the global variable index and a standalone compile. A receiver rooted at an
+// in-scope local (e.g. `v` or `v.child`) is typed from that binding.
+func (a *Analyzer) resolveReceiverTypeAt(content string, dot int, recv string) string {
+	if t := a.resolveReceiverType(recv); t != "" {
+		return t
 	}
-	ast := a.compileContent(content)
-	if ast == nil {
-		return false
+	parts := strings.Split(recv, ".")
+	lb, ok := a.localBindingNamed(content, dot, parts[0])
+	if !ok || lb.typeName == "" {
+		return ""
 	}
-	native := ast.NativeRep()
-	info := native.SourceInfo()
-	ro := celtsource.RuneOffsets(content)
-	found := false
-	celtsource.Walk(native.Expr(), func(e celast.Expr) {
-		if found {
-			return
-		}
-		names, start, end := comprehensionBindScope(info, content, ro, e)
-		if start < 0 || end <= start {
-			return
-		}
-		for _, n := range names {
-			if n == name && start <= off && off < end {
-				found = true
-				return
-			}
-		}
-	})
-	return found
+	if len(parts) == 1 {
+		return lb.typeName
+	}
+	return a.index.ChainTypeName(lb.typeName, parts[1:])
 }
 
 // compileContent compiles content, falling back to a parsed (unchecked) AST when
@@ -329,57 +319,6 @@ func (a *Analyzer) compileContent(content string) *cel.Ast {
 		return parsed
 	}
 	return nil
-}
-
-// comprehensionBindScope returns the variable names a comprehension binds and
-// the byte span [start, end) in which they are visible. A comprehension's own
-// offset range is degenerate: its start is the argument-list `(` and there is
-// no stop, so the scope runs from that opening paren to the matching close.
-func comprehensionBindScope(info *celast.SourceInfo, content string, ro []int, e celast.Expr) (names []string, start, end int) {
-	switch e.Kind() {
-	case celast.ComprehensionKind:
-		c := e.AsComprehension()
-		if n := c.IterVar(); n != "" {
-			names = append(names, n)
-		}
-		if c.HasIterVar2() {
-			if n := c.IterVar2(); n != "" {
-				names = append(names, n)
-			}
-		}
-		if n := c.AccuVar(); n != "" {
-			names = append(names, n)
-		}
-	case celast.CallKind:
-		if isComprehensionMacroName(e.AsCall().FunctionName()) {
-			args := e.AsCall().Args()
-			if len(args) > 0 && args[0].Kind() == celast.IdentKind {
-				if n := args[0].AsIdent(); n != "" {
-					names = append(names, n)
-				}
-			}
-		}
-	}
-	if len(names) == 0 {
-		return names, -1, -1
-	}
-	start = -1
-	if r, ok := info.GetOffsetRange(e.ID()); ok {
-		start = celtsource.ByteOffset(ro, int(r.Start))
-	}
-	if start < 0 || start >= len(content) {
-		return names, -1, -1
-	}
-	return names, start, macroScopeEndAt(content, start)
-}
-
-// isComprehensionMacroName reports whether name is a comprehension macro.
-func isComprehensionMacroName(name string) bool {
-	switch name {
-	case "exists", "exists_one", "all", "filter", "map":
-		return true
-	}
-	return false
 }
 
 // macroScopeEndAt returns the byte index just past the `)` balancing the `(` at

@@ -247,6 +247,11 @@ type printer struct {
 	indent int
 
 	forceBrokenCall bool
+
+	// lastContainerInlined records whether the most recently rendered call
+	// argument was a list/map that was kept on a single line, so renderCallClose
+	// knows not to glue a closing paren onto its `]`/`}`.
+	lastContainerInlined bool
 }
 
 func (p *printer) indentStr() string {
@@ -435,7 +440,7 @@ func (p *printer) renderCallClose(t *call) {
 	last := t.args[len(t.args)-1]
 	switch last.value.(type) {
 	case *listLit, *mapLit:
-		if !last.commentPresent {
+		if !last.commentPresent && !p.lastContainerInlined {
 			p.write(")")
 			return
 		}
@@ -459,11 +464,9 @@ func (p *printer) renderCallArg(i int, av callArg, freshLine, last bool) bool {
 	a := av.value
 	switch v := a.(type) {
 	case *listLit:
-		p.renderCallArgContainer('[', ']', v.elems, av.comment, av.commentPresent, i, last)
-		return true
+		return p.renderCallArgContainerArg('[', ']', v.elems, av, i, last)
 	case *mapLit:
-		p.renderCallArgContainer('{', '}', v.elems, av.comment, av.commentPresent, i, last)
-		return true
+		return p.renderCallArgContainerArg('{', '}', v.elems, av, i, last)
 	}
 
 	inline := inlineNode(a)
@@ -520,6 +523,30 @@ func (p *printer) renderCallArgContainer(open, closing byte, elems []elem, comme
 	if present {
 		p.writef(" // %s", comment)
 	}
+}
+
+// renderCallArgContainerArg renders a list/map call argument. A short container
+// (no comments, fits on the line) is kept on a single line so a list such as
+// ["test"] does not get broken across lines just because the enclosing call is
+// broken; longer or commented containers fall through to renderCallArgContainer.
+func (p *printer) renderCallArgContainerArg(open, closing byte, elems []elem, av callArg, i int, last bool) bool {
+	a := av.value
+	inline := inlineNode(a)
+	if canInline(a) && p.inlineFits(inline, a) {
+		p.lastContainerInlined = true
+		p.newline()
+		p.write(inline)
+		if !last {
+			p.write(",")
+		}
+		if av.commentPresent {
+			p.writef(" // %s", av.comment)
+		}
+		return true
+	}
+	p.lastContainerInlined = false
+	p.renderCallArgContainer(open, closing, elems, av.comment, av.commentPresent, i, last)
+	return true
 }
 
 func isSimpleArg(n node) bool {

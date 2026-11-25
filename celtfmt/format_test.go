@@ -356,9 +356,10 @@ func TestBreakOperatorsConditional(t *testing.T) {
 }
 
 // TestBreakCallArgContainerIndent asserts that a list or map used as a
-// non-first argument of a broken call is indented relative to its own bracket
-// (elements one level deeper, closing bracket at the argument-body indent),
-// rather than collapsing to the argument-body indent.
+// non-first argument of a broken call and that cannot be inlined (here because
+// it carries a comment) is indented relative to its own bracket (elements one
+// level deeper, closing bracket at the argument-body indent), rather than
+// collapsing to the argument-body indent.
 func TestBreakCallArgContainerIndent(t *testing.T) {
 	tests := []struct {
 		name string
@@ -367,13 +368,51 @@ func TestBreakCallArgContainerIndent(t *testing.T) {
 	}{
 		{
 			name: "list non-first arg",
+			src:  "f(g(a, [1, // keep\n 2], b && c))",
+			want: "f(\n  g(\n    a,\n    [\n      1, // keep\n      2,\n    ],\n    b\n      && c\n  )\n)",
+		},
+		{
+			name: "map non-first arg",
+			src:  "f(g(a, {k: 1, // keep\n l: 2}, b && c))",
+			want: "f(\n  g(\n    a,\n    {\n      k: 1, // keep\n      l: 2,\n    },\n    b\n      && c\n  )\n)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := FormatExpr(tt.src, fmtConfigOf(fmtBreakOps()))
+			if err != nil {
+				t.Fatalf("FormatExpr: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("FormatExpr = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShortCallArgContainerStaysInline asserts that a short list/map used as a
+// call argument is kept on a single line even when the enclosing call breaks,
+// so a value such as ["test"] is not needlessly exploded onto multiple lines.
+func TestShortCallArgContainerStaysInline(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "list non-first arg",
 			src:  "f(g(a, [1, 2], b && c))",
-			want: "f(\n  g(\n    a,\n    [\n      1,\n      2,\n    ],\n    b\n      && c\n  )\n)",
+			want: "f(\n  g(\n    a,\n    [1, 2],\n    b\n      && c\n  )\n)",
 		},
 		{
 			name: "map non-first arg",
 			src:  "f(g(a, {k: 1}, b && c))",
-			want: "f(\n  g(\n    a,\n    {\n      k: 1,\n    },\n    b\n      && c\n  )\n)",
+			want: "f(\n  g(\n    a,\n    {k: 1},\n    b\n      && c\n  )\n)",
+		},
+		{
+			name: "list last arg closes paren on own line",
+			src:  "f(a, [1, 2], b && c)",
+			want: "f(\n  a,\n  [1, 2],\n  b\n    && c\n)",
 		},
 	}
 	for _, tt := range tests {

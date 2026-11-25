@@ -56,7 +56,7 @@ func (a *Analyzer) Completion(content string, line, char int) []CompletionItem {
 	if len(prefix) < minTopLevelPrefix {
 		return nil
 	}
-	return a.topLevel(prefix)
+	return a.topLevel(content, off, prefix)
 }
 
 const minTopLevelPrefix = 2
@@ -69,7 +69,7 @@ func lastSegment(path string) string {
 	return path
 }
 
-func (a *Analyzer) topLevel(prefix string) []CompletionItem {
+func (a *Analyzer) topLevel(content string, off int, prefix string) []CompletionItem {
 	var out []CompletionItem
 	for _, c := range a.index.Candidates() {
 		switch c.Kind {
@@ -78,6 +78,19 @@ func (a *Analyzer) topLevel(prefix string) []CompletionItem {
 				out = append(out, it)
 			}
 		}
+	}
+	// Locally bound variables (cel.bind variables and comprehension iter/accu
+	// variables) are in scope only within their binding, so they are offered
+	// alongside the global candidates when the cursor is inside that scope.
+	for _, lb := range a.localBindings(content, off) {
+		if !strings.HasPrefix(lb.name, prefix) {
+			continue
+		}
+		out = append(out, CompletionItem{
+			Label:         lb.name,
+			Kind:          CompletionKindVariable,
+			Documentation: lb.hover(),
+		})
 	}
 	return dedupeItems(out)
 }
@@ -88,7 +101,7 @@ func (a *Analyzer) memberItems(content string, lineStart, dot int, prefix string
 		return nil
 	}
 	var cands []celtindex.Candidate
-	docType := a.resolveReceiverType(recv)
+	docType := a.resolveReceiverTypeAt(content, dot, recv)
 	if docType != "" {
 		cands = a.index.TypeMembers(docType)
 		if cands == nil {

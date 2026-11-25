@@ -118,14 +118,14 @@ func TestBuiltinMacroHoverExpansionIndependentOfCustomMacros(t *testing.T) {
 			}
 			got := a.Hover(src, 0, strings.Index(src, "exists"))
 			// Macro tracking must work for builtin macros regardless of any
-			// custom macros. A comprehension macro (exists/all/map/filter) has
-			// no distinct textual desugaring that Unparse can render, so the
-			// hover identifies the macro but must not label a fake expansion.
+			// custom macros. A comprehension macro (exists/all/map/filter) is
+			// rendered as its own call (as-is), so the hover shows the macro
+			// identity and its as-is form, independent of any custom macros.
 			if !strings.Contains(got, "exists") {
 				t.Errorf("builtin macro hover missing macro identity: %q", got)
 			}
-			if strings.Contains(got, "expands to:") {
-				t.Errorf("builtin comprehension macro hover reported a non-extension as an expansion: %q", got)
+			if !strings.Contains(got, "[1, 2].exists(x, x > 0)") {
+				t.Errorf("builtin comprehension macro hover missing as-is form: %q", got)
 			}
 		})
 	}
