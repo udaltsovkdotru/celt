@@ -493,6 +493,12 @@ func (p *printer) renderCallArg(i int, av callArg, freshLine, last bool) bool {
 	}
 	// A trailing comment is the last thing on its line, so the next argument
 	// must start on a fresh line (appending after the comment would swallow it).
+	if isSimpleArg(a) {
+		// A simple argument is a single token on one line, so even when the
+		// width limit pushed it onto a fresh line the next argument can share
+		// that line.
+		return av.commentPresent
+	}
 	return !fitsInline || av.commentPresent
 }
 

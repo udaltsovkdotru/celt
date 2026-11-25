@@ -492,6 +492,26 @@ func TestFormatIdempotent(t *testing.T) {
 	}
 }
 
+// TestFormatCallArgsPackOnSharedLine verifies that short string arguments of a
+// broken call pack greedily to the width, and that an argument pushed onto a
+// fresh line by the width limit does not force the following argument onto yet
+// another line — a simple argument is a single token, so the next one shares
+// its line.
+func TestFormatCallArgsPackOnSharedLine(t *testing.T) {
+	src := `foo("alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo")`
+	want := `foo(
+  "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+  "india", "juliet", "kilo"
+)`
+	got, err := FormatExpr(src, fmtConfigOf(fmtWidth(80)))
+	if err != nil {
+		t.Fatalf("FormatExpr: %v", err)
+	}
+	if got != want {
+		t.Errorf("FormatExpr = %q, want %q", got, want)
+	}
+}
+
 func TestFormatKeepsTrailingCommentBlocks(t *testing.T) {
 	// A list/map whose elements carry trailing `//` comments must stay
 	// multi-line. CEL has no block comments, so collapsing such a block onto
